@@ -16,7 +16,7 @@ app = FastAPI(title="SiteScore API", version="0.1.0")
 
 allowed_origins = [
     origin.strip()
-    for origin in os.getenv("FRONTEND_URL", "http://localhost:5173", "https://site-score-sable.vercel.app").split(",")
+    for origin in os.getenv("FRONTEND_URL", "https://site-score-sable.vercel.app").split(",")
     if origin.strip()
 ]
 app.add_middleware(
