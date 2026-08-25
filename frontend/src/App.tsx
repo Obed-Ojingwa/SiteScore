@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from 'react'
-import { ArrowUpRight, Check, ChevronLeft, CircleAlert, Code2, FileCode2, Globe2, ImageOff, LoaderCircle, ShieldCheck, Sparkles } from 'lucide-react'
+import { ArrowUpRight, Check, ChevronLeft, CircleAlert, Code2, Download, FileCode2, Globe2, ImageOff, LoaderCircle, ShieldCheck, Sparkles } from 'lucide-react'
 
 type AuditData = {
   url: string
@@ -44,6 +44,9 @@ function App() {
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [isCopied, setIsCopied] = useState(false)
+  const [email, setEmail] = useState('')
+  const [isUnlocked, setIsUnlocked] = useState(false)
+  const [isSubmittingEmail, setIsSubmittingEmail] = useState(false)
 
   useEffect(() => {
     const shortId = window.location.pathname.match(/^\/r\/([a-zA-Z0-9_-]+)$/)?.[1]
@@ -54,6 +57,7 @@ function App() {
         const body = await response.json()
         if (!response.ok) throw new Error(body.detail ?? 'That shared report could not be found.')
         setAudit(body)
+        setIsUnlocked(window.localStorage.getItem(`sitescore-unlocked-${shortId}`) === 'true')
       })
       .catch((requestError) => setError(requestError instanceof Error ? requestError.message : 'That shared report could not be loaded.'))
       .finally(() => setIsLoading(false))
@@ -66,10 +70,40 @@ function App() {
     window.setTimeout(() => setIsCopied(false), 1800)
   }
 
+  async function unlockReport(event: FormEvent) {
+    event.preventDefault()
+    if (!audit?.share_id || !email.trim()) return
+    setIsSubmittingEmail(true)
+    try {
+      const response = await fetch(`${API_BASE}/api/reports/${audit.share_id}/lead`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: email.trim() }) })
+      const body = await response.json()
+      if (!response.ok) throw new Error(body.detail ?? 'We could not save your email.')
+      setIsUnlocked(true)
+      window.localStorage.setItem(`sitescore-unlocked-${audit.share_id}`, 'true')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'We could not save your email.')
+    } finally {
+      setIsSubmittingEmail(false)
+    }
+  }
+
+  async function downloadPdf() {
+    if (!audit?.share_id || !email.trim()) return
+    const response = await fetch(`${API_BASE}/api/reports/${audit.share_id}/pdf`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: email.trim() }) })
+    if (!response.ok) return
+    const blob = await response.blob()
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = `sitescore-${audit.share_id}.pdf`
+    link.click()
+    URL.revokeObjectURL(link.href)
+  }
+
   async function handleSubmit(event: FormEvent) {
     event.preventDefault()
     setError('')
     setAudit(null)
+    setIsUnlocked(false)
     const candidate = url.trim()
     if (!candidate) {
       setError('Enter a URL to start the crawl.')
@@ -124,7 +158,7 @@ function App() {
       <button className="back-button" onClick={() => setAudit(null)}><ChevronLeft size={17} /> New crawl</button>
       <div className="results-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> AUDIT COMPLETE</div><h1>Your site's read.</h1><p>Scored from the signals found at <strong>{audit.final_url}</strong></p></div><div className="result-actions"><div className="score-badge"><strong>{audit.overall_score}</strong><span>/ 100 · Grade {audit.grade}</span></div>{audit.share_url && <button className="share-button" onClick={copyShareLink}>{isCopied ? <Check size={15} /> : <ArrowUpRight size={15} />} {isCopied ? 'Copied' : 'Copy share link'}</button>}</div></div>
       <div className="score-strip">{Object.entries(audit.scores).map(([key, value]) => <div className="score-item" key={key}><div><span>{key.replaceAll('_', ' ')}</span><strong>{value}</strong></div><div className="score-bar"><i style={{ width: `${value}%` }} /></div></div>)}</div>
-      {audit.issues.length > 0 && <section className="issues-panel"><div className="panel-heading"><div><div className="eyebrow dark"><span className="eyebrow-line" /> PRIORITY FIXES</div><h2>What to look at first.</h2></div><span className="issue-count">{audit.issues.length} highest-impact issues</span></div><div className="issue-list">{audit.issues.map((issue, index) => <div className="issue" key={`${issue.title}-${index}`}><span className="issue-number">0{index + 1}</span><div><div className="issue-meta"><span>{issue.category}</span><b>{issue.lost_points} pts at risk</b></div><h3>{issue.title}</h3><p>{issue.explanation}</p></div></div>)}</div></section>}
+      {audit.issues.length > 0 && <section className="issues-panel"><div className="panel-heading"><div><div className="eyebrow dark"><span className="eyebrow-line" /> PRIORITY FIXES</div><h2>What to look at first.</h2></div>{isUnlocked ? <button className="pdf-button" onClick={downloadPdf}><Download size={14} /> Download PDF</button> : <span className="issue-count">{audit.issues.length} highest-impact issues</span>}</div>{isUnlocked ? <div className="issue-list">{audit.issues.map((issue, index) => <div className="issue" key={`${issue.title}-${index}`}><span className="issue-number">0{index + 1}</span><div><div className="issue-meta"><span>{issue.category}</span><b>{issue.lost_points} pts at risk</b></div><h3>{issue.title}</h3><p>{issue.explanation}</p></div></div>)}</div> : <form className="email-gate" onSubmit={unlockReport}><div><strong>Unlock the fix list</strong><p>Get the plain-English actions behind this score, plus a downloadable PDF.</p></div><div className="email-gate-form"><input type="email" required value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@company.com" aria-label="Email address" /><button type="submit" disabled={isSubmittingEmail}>{isSubmittingEmail ? <LoaderCircle className="spin" size={15} /> : <>Unlock report <ArrowUpRight size={15} /></>}</button></div></form>}</section>}
       <div className="signal-grid">
         <article className="signal-card signal-wide"><div className="card-heading"><span className="icon-box"><FileCode2 size={17} /></span><span><h2>Page basics</h2><p>The essentials search engines read first.</p></span></div><div className="data-list"><div><dt>Title tag</dt><dd>{audit.title || <span className="empty">Not found</span>}</dd></div><div><dt>Meta description</dt><dd>{audit.meta_description || <span className="empty">Not found</span>}</dd></div><div><dt>H1 tags <small>({audit.h1_tags.length})</small></dt><dd>{audit.h1_tags.length ? audit.h1_tags.map((heading, index) => <span className="tag" key={`${heading}-${index}`}>{heading}</span>) : <span className="empty">None found</span>}</dd></div></div></article>
         <article className="signal-card"><div className="card-heading"><span className="icon-box blue"><ShieldCheck size={17} /></span><span><h2>Access & trust</h2><p>Can crawlers find and understand it?</p></span></div><div className="check-list"><CheckRow label="HTTPS connection" value={audit.is_https} /><CheckRow label="Viewport meta" value={audit.viewport_meta.exists} detail={audit.viewport_meta.exists ? 'Present' : 'Missing'} /><CheckRow label="robots.txt" value={audit.robots_txt.exists} detail={audit.robots_txt.exists ? 'Found' : 'Missing'} /><CheckRow label="sitemap.xml" value={audit.sitemap_xml.exists} detail={audit.sitemap_xml.exists ? 'Found' : 'Missing'} /></div></article>
@@ -134,7 +168,7 @@ function App() {
       </div>
       <div className="results-footnote"><Sparkles size={14} /> Score and priorities are based on the exact Stage 2 rubric. Detailed recommendations come next.</div>
     </section>}
-    <footer className="shell footer"><span>© 2026 SiteScore</span><span>Simple signals. Better sites.</span></footer>
+    <footer className="shell footer"><span>© 2026 SiteScore</span><span>Made by <a href="https://nerdpace.com" target="_blank" rel="noreferrer">NerdPace</a></span></footer>
   </main>
 }
 

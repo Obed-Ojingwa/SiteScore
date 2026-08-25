@@ -4,6 +4,7 @@ import os
 import re
 import html
 import secrets
+import io
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -12,12 +13,14 @@ import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, EmailStr, HttpUrl
 from sqlalchemy import create_engine, text
 
 
 app = FastAPI(title="SiteScore API", version="0.1.0")
 database_url = os.getenv("DATABASE_URL")
+if database_url and database_url.startswith("postgresql://"):
+    database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 engine = create_engine(database_url, pool_pre_ping=True) if database_url else None
 
 allowed_origins = [
@@ -62,6 +65,15 @@ class AuditResponse(BaseModel):
     share_id: str | None = None
     share_url: str | None = None
     og_image_url: str | None = None
+
+
+class LeadCaptureRequest(BaseModel):
+    email: EmailStr
+
+
+class LeadCaptureResponse(BaseModel):
+    success: bool
+    message: str
 
 
 def public_api_url() -> str:
@@ -112,6 +124,57 @@ def load_report(short_id: str) -> dict[str, Any]:
     if row is None:
         raise HTTPException(status_code=404, detail="That shared report does not exist.")
     return row["report"]
+
+
+def capture_lead(short_id: str, email: str) -> None:
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Report storage is not configured on the API.")
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text("""
+                    insert into public.lead_captures (report_short_id, email)
+                    values (:short_id, :email)
+                    on conflict (report_short_id, email) do nothing
+                """),
+                {"short_id": short_id, "email": email.lower()},
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Your email could not be saved. Please try again.") from exc
+
+
+def lead_has_access(short_id: str, email: str) -> bool:
+    if engine is None:
+        return False
+    with engine.connect() as connection:
+        return connection.execute(
+            text("select 1 from public.lead_captures where report_short_id = :short_id and email = :email"),
+            {"short_id": short_id, "email": email.lower()},
+        ).first() is not None
+
+
+def build_pdf(report: dict[str, Any]) -> bytes:
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="PDF generation is not available on the API.") from exc
+
+    buffer = io.BytesIO()
+    document = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=0.7 * inch, leftMargin=0.7 * inch, topMargin=0.65 * inch, bottomMargin=0.65 * inch)
+    styles = getSampleStyleSheet()
+    story = [Paragraph("SiteScore report", styles["Title"]), Paragraph(f"{report['final_url']} · Grade {report['grade']} · {report['overall_score']}/100", styles["Heading2"]), Spacer(1, 0.2 * inch)]
+    story.append(Paragraph("Priority fixes", styles["Heading2"]))
+    for index, issue in enumerate(report.get("issues", []), 1):
+        story.extend([Paragraph(f"{index}. {issue['title']} ({issue['category']})", styles["Heading3"]), Paragraph(issue["explanation"], styles["BodyText"])])
+    story.append(Spacer(1, 0.2 * inch))
+    story.append(Paragraph("Raw crawl signals", styles["Heading2"]))
+    for label, value in (("Title", report.get("title") or "Not found"), ("Meta description", report.get("meta_description") or "Not found"), ("H1 count", str(len(report.get("h1_tags", [])))), ("Page weight", f"{report.get('page_weight_bytes', 0):,} bytes"), ("Images missing alt", str(report.get("images_missing_alt", 0)))):
+        story.append(Paragraph(f"<b>{html.escape(label)}:</b> {html.escape(value)}", styles["BodyText"]))
+    document.build(story)
+    return buffer.getvalue()
 
 
 def report_urls(short_id: str) -> dict[str, str]:
@@ -249,11 +312,11 @@ async def get_report(short_id: str) -> AuditResponse:
 
 @app.get("/api/reports/{short_id}/og.svg")
 async def report_og_image(short_id: str) -> Response:
-        report = load_report(short_id)
-        domain = html.escape(urlparse(report["final_url"]).netloc)
-        grade = html.escape(report["grade"])
-        score = report["overall_score"]
-        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+    report = load_report(short_id)
+    domain = html.escape(urlparse(report["final_url"]).netloc)
+    grade = html.escape(report["grade"])
+    score = report["overall_score"]
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
             <rect width="1200" height="630" fill="#07162e"/>
             <circle cx="1010" cy="-40" r="360" fill="#0b2347"/>
             <text x="76" y="100" fill="#77e1b5" font-family="Arial,sans-serif" font-size="28" font-weight="700">SiteScore</text>
@@ -264,24 +327,39 @@ async def report_og_image(short_id: str) -> Response:
             <text x="315" y="500" fill="#9db1cd" font-family="Arial,sans-serif" font-size="22">/ 100 overall score</text>
             <rect x="76" y="550" width="1048" height="2" fill="#24436d"/>
             <text x="76" y="590" fill="#9db1cd" font-family="Arial,sans-serif" font-size="18">Technical signals, made legible.</text>
-        </svg>'''
-        return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
+    </svg>'''
+    return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.post("/api/reports/{short_id}/lead", response_model=LeadCaptureResponse)
+async def create_lead(short_id: str, request: LeadCaptureRequest) -> LeadCaptureResponse:
+    load_report(short_id)
+    capture_lead(short_id, str(request.email))
+    return LeadCaptureResponse(success=True, message="Your detailed fixes are unlocked.")
+
+
+@app.post("/api/reports/{short_id}/pdf")
+async def download_pdf(short_id: str, request: LeadCaptureRequest) -> Response:
+    report = load_report(short_id)
+    if not lead_has_access(short_id, str(request.email)):
+        raise HTTPException(status_code=403, detail="Submit your email before downloading the report.")
+    return Response(content=build_pdf(report), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="sitescore-{short_id}.pdf"'})
 
 
 @app.get("/r/{short_id}", response_class=Response)
 async def shared_report(short_id: str) -> Response:
-        report = load_report(short_id)
-        urls = report_urls(short_id)
-        title = html.escape(f"{report['grade']} grade for {urlparse(report['final_url']).netloc} | SiteScore")
-        description = html.escape(f"SiteScore found an overall SEO score of {report['overall_score']}/100 for {urlparse(report['final_url']).netloc}.")
-        destination = f"{frontend_url()}/r/{short_id}"
-        page = f'''<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
+    report = load_report(short_id)
+    urls = report_urls(short_id)
+    title = html.escape(f"{report['grade']} grade for {urlparse(report['final_url']).netloc} | SiteScore")
+    description = html.escape(f"SiteScore found an overall SEO score of {report['overall_score']}/100 for {urlparse(report['final_url']).netloc}.")
+    destination = f"{frontend_url()}/r/{short_id}"
+    page = f'''<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
             <meta name="description" content="{description}"><meta property="og:title" content="{title}">
             <meta property="og:description" content="{description}"><meta property="og:type" content="website">
             <meta property="og:image" content="{urls['og_image_url']}"><meta property="og:url" content="{urls['share_url']}">
             <meta http-equiv="refresh" content="0;url={destination}"></head>
             <body style="font-family:Arial,sans-serif;background:#07162e;color:white;padding:40px">Opening your SiteScore report...</body></html>'''
-        return Response(content=page, media_type="text/html")
+    return Response(content=page, media_type="text/html")
 
 
 @app.post("/api/audit", response_model=AuditResponse)
