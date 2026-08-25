@@ -5,6 +5,7 @@ import re
 import html
 import secrets
 import io
+import logging
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -15,12 +16,18 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, HttpUrl
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 
 
 app = FastAPI(title="SiteScore API", version="0.1.0")
 database_url = os.getenv("DATABASE_URL")
 if database_url and database_url.startswith("postgresql://"):
     database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+if database_url:
+    parsed_database_url = make_url(database_url)
+    if "sslmode" not in parsed_database_url.query:
+        database_url = str(parsed_database_url.update_query_dict({"sslmode": "require"}))
+logger = logging.getLogger("uvicorn.error")
 engine = create_engine(database_url, pool_pre_ping=True) if database_url else None
 
 allowed_origins = [
@@ -112,6 +119,7 @@ def persist_report(report: dict[str, Any]) -> str:
             return short_id
         except Exception as exc:
             if "duplicate key" not in str(exc).lower():
+                logger.exception("Could not persist audit report")
                 raise HTTPException(status_code=503, detail="The audit was completed but could not be saved.") from exc
     raise HTTPException(status_code=503, detail="Could not create a unique share link. Please try again.")
 
@@ -301,7 +309,15 @@ def meta_value(soup: BeautifulSoup, name: str) -> str | None:
 
 @app.get("/api/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    if engine is None:
+        return {"status": "ok", "database": "not_configured"}
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("select 1"))
+        return {"status": "ok", "database": "connected"}
+    except Exception:
+        logger.exception("Database health check failed")
+        return {"status": "degraded", "database": "unavailable"}
 
 
 @app.get("/api/reports/{short_id}", response_model=AuditResponse)
