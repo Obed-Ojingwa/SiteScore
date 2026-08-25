@@ -16,6 +16,12 @@ type AuditData = {
   images_total: number
   json_ld: unknown[]
   page_weight_bytes: number
+  has_sitewide_noindex: boolean
+  mixed_content_count: number
+  scores: Record<string, number>
+  overall_score: number
+  grade: string
+  issues: { category: string; lost_points: number; title: string; explanation: string }[]
 }
 
 const API_BASE = import.meta.env.VITE_API_URL ?? ''
@@ -91,7 +97,9 @@ function App() {
       <div className="hero-footer"><span>Built for curious marketers</span><span>Stage 01 <i /> Crawl & inspect</span></div>
     </section> : <section className="results shell">
       <button className="back-button" onClick={() => setAudit(null)}><ChevronLeft size={17} /> New crawl</button>
-      <div className="results-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> CRAWL COMPLETE</div><h1>Raw site signals.</h1><p>Everything SiteScore found at <strong>{audit.final_url}</strong></p></div><span className="http-pill"><span /> HTTP {audit.status_code}</span></div>
+      <div className="results-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> AUDIT COMPLETE</div><h1>Your site's read.</h1><p>Scored from the signals found at <strong>{audit.final_url}</strong></p></div><div className="score-badge"><strong>{audit.overall_score}</strong><span>/ 100 · Grade {audit.grade}</span></div></div>
+      <div className="score-strip">{Object.entries(audit.scores).map(([key, value]) => <div className="score-item" key={key}><div><span>{key.replaceAll('_', ' ')}</span><strong>{value}</strong></div><div className="score-bar"><i style={{ width: `${value}%` }} /></div></div>)}</div>
+      {audit.issues.length > 0 && <section className="issues-panel"><div className="panel-heading"><div><div className="eyebrow dark"><span className="eyebrow-line" /> PRIORITY FIXES</div><h2>What to look at first.</h2></div><span className="issue-count">{audit.issues.length} highest-impact issues</span></div><div className="issue-list">{audit.issues.map((issue, index) => <div className="issue" key={`${issue.title}-${index}`}><span className="issue-number">0{index + 1}</span><div><div className="issue-meta"><span>{issue.category}</span><b>{issue.lost_points} pts at risk</b></div><h3>{issue.title}</h3><p>{issue.explanation}</p></div></div>)}</div></section>}
       <div className="signal-grid">
         <article className="signal-card signal-wide"><div className="card-heading"><span className="icon-box"><FileCode2 size={17} /></span><span><h2>Page basics</h2><p>The essentials search engines read first.</p></span></div><div className="data-list"><div><dt>Title tag</dt><dd>{audit.title || <span className="empty">Not found</span>}</dd></div><div><dt>Meta description</dt><dd>{audit.meta_description || <span className="empty">Not found</span>}</dd></div><div><dt>H1 tags <small>({audit.h1_tags.length})</small></dt><dd>{audit.h1_tags.length ? audit.h1_tags.map((heading, index) => <span className="tag" key={`${heading}-${index}`}>{heading}</span>) : <span className="empty">None found</span>}</dd></div></div></article>
         <article className="signal-card"><div className="card-heading"><span className="icon-box blue"><ShieldCheck size={17} /></span><span><h2>Access & trust</h2><p>Can crawlers find and understand it?</p></span></div><div className="check-list"><CheckRow label="HTTPS connection" value={audit.is_https} /><CheckRow label="Viewport meta" value={audit.viewport_meta.exists} detail={audit.viewport_meta.exists ? 'Present' : 'Missing'} /><CheckRow label="robots.txt" value={audit.robots_txt.exists} detail={audit.robots_txt.exists ? 'Found' : 'Missing'} /><CheckRow label="sitemap.xml" value={audit.sitemap_xml.exists} detail={audit.sitemap_xml.exists ? 'Found' : 'Missing'} /></div></article>
@@ -99,7 +107,7 @@ function App() {
         <article className="signal-card"><div className="card-heading"><span className="icon-box purple"><Code2 size={17} /></span><span><h2>Structured data</h2><p>Machine-readable context.</p></span></div><div className="json-status"><span className={audit.json_ld.length ? 'status-dot is-good' : 'status-dot is-muted'}>{audit.json_ld.length ? <Check size={13} /> : <CircleAlert size={13} />}</span><strong>{audit.json_ld.length ? `${audit.json_ld.length} JSON-LD block${audit.json_ld.length > 1 ? 's' : ''} found` : 'No JSON-LD found'}</strong></div>{audit.json_ld.length > 0 && <pre>{JSON.stringify(audit.json_ld[0], null, 2)}</pre>}</article>
         <article className="signal-card crawl-meta"><div className="card-heading"><span className="icon-box green"><Globe2 size={17} /></span><span><h2>Crawl details</h2><p>What was fetched and measured.</p></span></div><div className="meta-pairs"><span><b>Page weight</b>{formatBytes(audit.page_weight_bytes)}</span><span><b>Final URL</b>{audit.final_url}</span><span><b>Requested URL</b>{audit.url}</span></div></article>
       </div>
-      <div className="results-footnote"><Sparkles size={14} /> This is raw crawl data. Scoring and prioritized fixes arrive in Stage 2.</div>
+      <div className="results-footnote"><Sparkles size={14} /> Score and priorities are based on the exact Stage 2 rubric. Detailed recommendations come next.</div>
     </section>}
     <footer className="shell footer"><span>© 2026 SiteScore</span><span>Simple signals. Better sites.</span></footer>
   </main>

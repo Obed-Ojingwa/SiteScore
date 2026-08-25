@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -47,6 +48,101 @@ class AuditResponse(BaseModel):
     images_total: int
     json_ld: list[Any]
     page_weight_bytes: int
+    has_sitewide_noindex: bool
+    mixed_content_count: int
+    scores: dict[str, int]
+    overall_score: int
+    grade: str
+    issues: list[dict[str, Any]]
+
+
+@dataclass
+class ScoreIssue:
+    category: str
+    lost_points: int
+    title: str
+    explanation: str
+
+
+def score_audit(
+    *,
+    title: str | None,
+    meta_description: str | None,
+    h1_tags: list[str],
+    robots_exists: bool,
+    robots_blocks_all: bool,
+    sitemap_exists: bool,
+    has_sitewide_noindex: bool,
+    json_ld: list[Any],
+    page_weight_bytes: int,
+    images_missing_alt: int,
+    images_total: int,
+    is_https: bool,
+    viewport_exists: bool,
+    mixed_content_count: int,
+) -> tuple[dict[str, int], int, str, list[dict[str, Any]]]:
+    issues: list[ScoreIssue] = []
+
+    indexability_checks = [robots_exists and not robots_blocks_all, sitemap_exists, not has_sitewide_noindex]
+    indexability = round(sum(indexability_checks) / len(indexability_checks) * 100)
+    if not indexability_checks[0]:
+        issues.append(ScoreIssue("Indexability", 20, "Review crawler access", "Make sure robots.txt exists and does not disallow all crawlers so search engines can access your site."))
+    if not indexability_checks[1]:
+        issues.append(ScoreIssue("Indexability", 20, "Add an XML sitemap", "Publish sitemap.xml and reference your important pages so search engines can discover them efficiently."))
+    if not indexability_checks[2]:
+        issues.append(ScoreIssue("Indexability", 20, "Remove sitewide noindex", "Remove the blanket noindex directive unless you intentionally want the whole site kept out of search results."))
+
+    on_page_checks = [title is not None and 30 <= len(title) <= 60, meta_description is not None and 120 <= len(meta_description) <= 160, len(h1_tags) == 1]
+    on_page = round(sum(on_page_checks) / len(on_page_checks) * 100)
+    if not on_page_checks[0]:
+        issues.append(ScoreIssue("On-page", 20, "Tune the title tag", "Add a descriptive title between 30 and 60 characters so searchers and crawlers understand the page quickly."))
+    if not on_page_checks[1]:
+        issues.append(ScoreIssue("On-page", 20, "Write a meta description", "Add a useful meta description between 120 and 160 characters to give the search result a clear preview."))
+    if not on_page_checks[2]:
+        issues.append(ScoreIssue("On-page", 20, "Use one clear H1", "Keep exactly one H1 that describes the page's primary topic and use lower-level headings for sections."))
+
+    valid_json_ld = bool(json_ld) and all(not (isinstance(item, dict) and "_invalid" in item) for item in json_ld)
+    structured_data = 100 if valid_json_ld else 0
+    if not valid_json_ld:
+        issues.append(ScoreIssue("Structured data", 20, "Add valid JSON-LD", "Add valid schema.org JSON-LD that describes the page so eligible search features can understand its content."))
+
+    image_ratio = images_missing_alt / images_total if images_total else 0
+    performance_checks = [page_weight_bytes < 2 * 1024 * 1024, image_ratio < 0.2]
+    performance = round(sum(performance_checks) / len(performance_checks) * 100)
+    if not performance_checks[0]:
+        issues.append(ScoreIssue("Performance signals", 10, "Reduce page weight", "Keep the initial HTML response under 2 MB by compressing content and removing unnecessary payload."))
+    if not performance_checks[1]:
+        issues.append(ScoreIssue("Performance signals", 10, "Fill in image alt text", "Add concise alt text to images so their meaning is available to screen readers and crawlers."))
+
+    security_checks = [is_https, viewport_exists, mixed_content_count == 0]
+    security = round(sum(security_checks) / len(security_checks) * 100)
+    if not security_checks[0]:
+        issues.append(ScoreIssue("Security/mobile", 20, "Enable HTTPS", "Serve the site over HTTPS to protect visitors and preserve trust in the browser and search results."))
+    if not security_checks[1]:
+        issues.append(ScoreIssue("Security/mobile", 20, "Add a viewport meta tag", "Add a responsive viewport declaration so the page can size correctly on phones and tablets."))
+    if not security_checks[2]:
+        issues.append(ScoreIssue("Security/mobile", 20, "Fix mixed content", "Update HTTP assets to HTTPS so browsers do not block insecure resources on the secure page."))
+
+    scores = {"indexability": indexability, "on_page": on_page, "structured_data": structured_data, "performance_signals": performance, "security_mobile": security}
+    overall_score = round(sum(scores.values()) / len(scores))
+    grade = "A" if overall_score >= 90 else "B" if overall_score >= 80 else "C" if overall_score >= 70 else "D" if overall_score >= 60 else "F"
+    issues.sort(key=lambda issue: issue.lost_points, reverse=True)
+    return scores, overall_score, grade, [issue.__dict__ for issue in issues[:5]]
+
+
+def robots_blocks_all(content: str | None) -> bool:
+    if not content:
+        return False
+    applies_to_all = False
+    for line in content.splitlines():
+        directive, _, value = line.partition(":")
+        directive = directive.strip().lower()
+        value = value.strip()
+        if directive == "user-agent":
+            applies_to_all = value == "*"
+        elif directive == "disallow" and applies_to_all and value == "/":
+            return True
+    return False
 
 
 async def fetch_optional(client: httpx.AsyncClient, url: str) -> tuple[bool, str | None, int | None]:
@@ -97,7 +193,8 @@ async def audit_site(request: AuditRequest) -> AuditResponse:
             response.raise_for_status()
             html = response.text
             soup = BeautifulSoup(html, "html.parser")
-            origin = f"{parsed.scheme}://{parsed.netloc}"
+            final_parsed = urlparse(str(response.url))
+            origin = f"{final_parsed.scheme}://{final_parsed.netloc}"
             robots_ok, robots_body, robots_status = await fetch_optional(client, urljoin(origin + "/", "robots.txt"))
             sitemap_ok, _, sitemap_status = await fetch_optional(client, urljoin(origin + "/", "sitemap.xml"))
     except httpx.InvalidURL as exc:
@@ -111,20 +208,60 @@ async def audit_site(request: AuditRequest) -> AuditResponse:
     missing_alt = sum(1 for image in images if not image.get("alt", "").strip())
     viewport = soup.find("meta", attrs={"name": re.compile("^viewport$", re.IGNORECASE)})
     final_url = str(response.url)
+    title = soup.title.get_text(strip=True) if soup.title else None
+    meta_description = meta_value(soup, "description")
+    h1_tags = [heading.get_text(" ", strip=True) for heading in soup.find_all("h1")]
+    json_ld = extract_json_ld(soup)
+    has_sitewide_noindex = any(
+        directive in {"noindex", "none"}
+        for tag in soup.find_all("meta", attrs={"name": re.compile("^robots$", re.IGNORECASE)})
+        for directive in re.split(r"[,\s]+", tag.get("content", "").lower())
+    )
+    mixed_content_count = sum(
+        1
+        for tag in soup.find_all(src=True)
+        if str(tag.get("src", "")).lower().startswith("http://")
+    ) + sum(
+        1
+        for tag in soup.find_all(href=True)
+        if str(tag.get("href", "")).lower().startswith("http://")
+    )
+    scores, overall_score, grade, issues = score_audit(
+        title=title,
+        meta_description=meta_description,
+        h1_tags=h1_tags,
+        robots_exists=robots_ok,
+        robots_blocks_all=robots_blocks_all(robots_body),
+        sitemap_exists=sitemap_ok,
+        has_sitewide_noindex=has_sitewide_noindex,
+        json_ld=json_ld,
+        page_weight_bytes=len(response.content),
+        images_missing_alt=missing_alt,
+        images_total=len(images),
+        is_https=urlparse(final_url).scheme.lower() == "https",
+        viewport_exists=viewport is not None,
+        mixed_content_count=mixed_content_count,
+    )
 
     return AuditResponse(
         url=target_url,
         final_url=final_url,
         status_code=response.status_code,
-        title=soup.title.get_text(strip=True) if soup.title else None,
-        meta_description=meta_value(soup, "description"),
-        h1_tags=[heading.get_text(" ", strip=True) for heading in soup.find_all("h1")],
+        title=title,
+        meta_description=meta_description,
+        h1_tags=h1_tags,
         robots_txt={"exists": robots_ok, "status_code": robots_status, "content": robots_body},
         sitemap_xml={"exists": sitemap_ok, "status_code": sitemap_status},
         viewport_meta={"exists": viewport is not None, "content": viewport.get("content") if viewport else None},
         is_https=urlparse(final_url).scheme.lower() == "https",
         images_missing_alt=missing_alt,
         images_total=len(images),
-        json_ld=extract_json_ld(soup),
+        json_ld=json_ld,
         page_weight_bytes=len(response.content),
+        has_sitewide_noindex=has_sitewide_noindex,
+        mixed_content_count=mixed_content_count,
+        scores=scores,
+        overall_score=overall_score,
+        grade=grade,
+        issues=issues,
     )
