@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import os
 import re
+import html
+import secrets
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
+from sqlalchemy import create_engine, text
 
 
 app = FastAPI(title="SiteScore API", version="0.1.0")
+database_url = os.getenv("DATABASE_URL")
+engine = create_engine(database_url, pool_pre_ping=True) if database_url else None
 
 allowed_origins = [
     origin.strip()
@@ -54,6 +59,64 @@ class AuditResponse(BaseModel):
     overall_score: int
     grade: str
     issues: list[dict[str, Any]]
+    share_id: str | None = None
+    share_url: str | None = None
+    og_image_url: str | None = None
+
+
+def public_api_url() -> str:
+    return os.getenv("PUBLIC_API_URL", "http://localhost:8000").rstrip("/")
+
+
+def frontend_url() -> str:
+    return os.getenv("FRONTEND_URL", "http://localhost:5173").split(",")[0].strip().rstrip("/")
+
+
+def persist_report(report: dict[str, Any]) -> str:
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Report storage is not configured on the API.")
+    from json import dumps
+
+    for _ in range(5):
+        short_id = secrets.token_urlsafe(7).replace("-", "_")[:10]
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    text("""
+                        insert into public.audit_reports
+                          (short_id, url, final_url, domain, overall_score, grade, report)
+                        values (:short_id, :url, :final_url, :domain, :overall_score, :grade, cast(:report as jsonb))
+                    """),
+                    {
+                        "short_id": short_id,
+                        "url": report["url"],
+                        "final_url": report["final_url"],
+                        "domain": urlparse(report["final_url"]).netloc,
+                        "overall_score": report["overall_score"],
+                        "grade": report["grade"],
+                        "report": dumps(report),
+                    },
+                )
+            return short_id
+        except Exception as exc:
+            if "duplicate key" not in str(exc).lower():
+                raise HTTPException(status_code=503, detail="The audit was completed but could not be saved.") from exc
+    raise HTTPException(status_code=503, detail="Could not create a unique share link. Please try again.")
+
+
+def load_report(short_id: str) -> dict[str, Any]:
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Report storage is not configured on the API.")
+    with engine.connect() as connection:
+        row = connection.execute(text("select report from public.audit_reports where short_id = :short_id"), {"short_id": short_id}).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="That shared report does not exist.")
+    return row["report"]
+
+
+def report_urls(short_id: str) -> dict[str, str]:
+    base = public_api_url()
+    return {"share_id": short_id, "share_url": f"{base}/r/{short_id}", "og_image_url": f"{base}/api/reports/{short_id}/og.svg"}
 
 
 @dataclass
@@ -178,6 +241,49 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/reports/{short_id}", response_model=AuditResponse)
+async def get_report(short_id: str) -> AuditResponse:
+    report = load_report(short_id)
+    return AuditResponse(**{**report, **report_urls(short_id)})
+
+
+@app.get("/api/reports/{short_id}/og.svg")
+async def report_og_image(short_id: str) -> Response:
+        report = load_report(short_id)
+        domain = html.escape(urlparse(report["final_url"]).netloc)
+        grade = html.escape(report["grade"])
+        score = report["overall_score"]
+        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+            <rect width="1200" height="630" fill="#07162e"/>
+            <circle cx="1010" cy="-40" r="360" fill="#0b2347"/>
+            <text x="76" y="100" fill="#77e1b5" font-family="Arial,sans-serif" font-size="28" font-weight="700">SiteScore</text>
+            <text x="76" y="200" fill="#9db1cd" font-family="Arial,sans-serif" font-size="24">SEO READ FOR</text>
+            <text x="76" y="260" fill="#f8fbff" font-family="Arial,sans-serif" font-size="44" font-weight="700">{domain}</text>
+            <text x="76" y="480" fill="#77e1b5" font-family="Arial,sans-serif" font-size="170" font-weight="700">{grade}</text>
+            <text x="310" y="455" fill="#f8fbff" font-family="Arial,sans-serif" font-size="88" font-weight="700">{score}</text>
+            <text x="315" y="500" fill="#9db1cd" font-family="Arial,sans-serif" font-size="22">/ 100 overall score</text>
+            <rect x="76" y="550" width="1048" height="2" fill="#24436d"/>
+            <text x="76" y="590" fill="#9db1cd" font-family="Arial,sans-serif" font-size="18">Technical signals, made legible.</text>
+        </svg>'''
+        return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.get("/r/{short_id}", response_class=Response)
+async def shared_report(short_id: str) -> Response:
+        report = load_report(short_id)
+        urls = report_urls(short_id)
+        title = html.escape(f"{report['grade']} grade for {urlparse(report['final_url']).netloc} | SiteScore")
+        description = html.escape(f"SiteScore found an overall SEO score of {report['overall_score']}/100 for {urlparse(report['final_url']).netloc}.")
+        destination = f"{frontend_url()}/r/{short_id}"
+        page = f'''<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
+            <meta name="description" content="{description}"><meta property="og:title" content="{title}">
+            <meta property="og:description" content="{description}"><meta property="og:type" content="website">
+            <meta property="og:image" content="{urls['og_image_url']}"><meta property="og:url" content="{urls['share_url']}">
+            <meta http-equiv="refresh" content="0;url={destination}"></head>
+            <body style="font-family:Arial,sans-serif;background:#07162e;color:white;padding:40px">Opening your SiteScore report...</body></html>'''
+        return Response(content=page, media_type="text/html")
+
+
 @app.post("/api/audit", response_model=AuditResponse)
 async def audit_site(request: AuditRequest) -> AuditResponse:
     target_url = str(request.url)
@@ -243,7 +349,7 @@ async def audit_site(request: AuditRequest) -> AuditResponse:
         mixed_content_count=mixed_content_count,
     )
 
-    return AuditResponse(
+    report = AuditResponse(
         url=target_url,
         final_url=final_url,
         status_code=response.status_code,
@@ -265,3 +371,5 @@ async def audit_site(request: AuditRequest) -> AuditResponse:
         grade=grade,
         issues=issues,
     )
+    share_id = persist_report(report.model_dump())
+    return AuditResponse(**{**report.model_dump(), **report_urls(share_id)})

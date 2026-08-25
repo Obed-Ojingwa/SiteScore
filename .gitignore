@@ -4,3 +4,4 @@ stages.md
 frontend/node_modules/
 frontend/env.local
 backend/.env
+supabase/

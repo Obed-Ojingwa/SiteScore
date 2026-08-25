@@ -1,4 +1,4 @@
-import { FormEvent, useState } from 'react'
+import { FormEvent, useEffect, useState } from 'react'
 import { ArrowUpRight, Check, ChevronLeft, CircleAlert, Code2, FileCode2, Globe2, ImageOff, LoaderCircle, ShieldCheck, Sparkles } from 'lucide-react'
 
 type AuditData = {
@@ -22,6 +22,9 @@ type AuditData = {
   overall_score: number
   grade: string
   issues: { category: string; lost_points: number; title: string; explanation: string }[]
+  share_id?: string
+  share_url?: string
+  og_image_url?: string
 }
 
 const API_BASE = import.meta.env.VITE_API_URL ?? ''
@@ -40,6 +43,28 @@ function App() {
   const [audit, setAudit] = useState<AuditData | null>(null)
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [isCopied, setIsCopied] = useState(false)
+
+  useEffect(() => {
+    const shortId = window.location.pathname.match(/^\/r\/([a-zA-Z0-9_-]+)$/)?.[1]
+    if (!shortId) return
+    setIsLoading(true)
+    fetch(`${API_BASE}/api/reports/${shortId}`)
+      .then(async (response) => {
+        const body = await response.json()
+        if (!response.ok) throw new Error(body.detail ?? 'That shared report could not be found.')
+        setAudit(body)
+      })
+      .catch((requestError) => setError(requestError instanceof Error ? requestError.message : 'That shared report could not be loaded.'))
+      .finally(() => setIsLoading(false))
+  }, [])
+
+  async function copyShareLink() {
+    if (!audit?.share_url) return
+    await navigator.clipboard.writeText(audit.share_url)
+    setIsCopied(true)
+    window.setTimeout(() => setIsCopied(false), 1800)
+  }
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault()
@@ -97,7 +122,7 @@ function App() {
       <div className="hero-footer"><span>Built for curious marketers</span><span>Stage 01 <i /> Crawl & inspect</span></div>
     </section> : <section className="results shell">
       <button className="back-button" onClick={() => setAudit(null)}><ChevronLeft size={17} /> New crawl</button>
-      <div className="results-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> AUDIT COMPLETE</div><h1>Your site's read.</h1><p>Scored from the signals found at <strong>{audit.final_url}</strong></p></div><div className="score-badge"><strong>{audit.overall_score}</strong><span>/ 100 · Grade {audit.grade}</span></div></div>
+      <div className="results-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> AUDIT COMPLETE</div><h1>Your site's read.</h1><p>Scored from the signals found at <strong>{audit.final_url}</strong></p></div><div className="result-actions"><div className="score-badge"><strong>{audit.overall_score}</strong><span>/ 100 · Grade {audit.grade}</span></div>{audit.share_url && <button className="share-button" onClick={copyShareLink}>{isCopied ? <Check size={15} /> : <ArrowUpRight size={15} />} {isCopied ? 'Copied' : 'Copy share link'}</button>}</div></div>
       <div className="score-strip">{Object.entries(audit.scores).map(([key, value]) => <div className="score-item" key={key}><div><span>{key.replaceAll('_', ' ')}</span><strong>{value}</strong></div><div className="score-bar"><i style={{ width: `${value}%` }} /></div></div>)}</div>
       {audit.issues.length > 0 && <section className="issues-panel"><div className="panel-heading"><div><div className="eyebrow dark"><span className="eyebrow-line" /> PRIORITY FIXES</div><h2>What to look at first.</h2></div><span className="issue-count">{audit.issues.length} highest-impact issues</span></div><div className="issue-list">{audit.issues.map((issue, index) => <div className="issue" key={`${issue.title}-${index}`}><span className="issue-number">0{index + 1}</span><div><div className="issue-meta"><span>{issue.category}</span><b>{issue.lost_points} pts at risk</b></div><h3>{issue.title}</h3><p>{issue.explanation}</p></div></div>)}</div></section>}
       <div className="signal-grid">
