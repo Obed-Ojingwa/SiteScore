@@ -29,6 +29,16 @@ type AuditData = {
 
 const API_BASE = import.meta.env.VITE_API_URL ?? ''
 
+async function readApiResponse(response: Response) {
+  const contentType = response.headers.get('content-type') ?? ''
+  const body = contentType.includes('application/json') ? await response.json() : await response.text()
+  if (!response.ok) {
+    const message = typeof body === 'string' ? body.replace(/<[^>]*>/g, '').trim() : body.detail
+    throw new Error(message || `The API returned HTTP ${response.status}.`)
+  }
+  return body
+}
+
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
   return `${(bytes / 1024).toFixed(1)} KB`
@@ -54,8 +64,7 @@ function App() {
     setIsLoading(true)
     fetch(`${API_BASE}/api/reports/${shortId}`)
       .then(async (response) => {
-        const body = await response.json()
-        if (!response.ok) throw new Error(body.detail ?? 'That shared report could not be found.')
+        const body = await readApiResponse(response)
         setAudit(body)
         setIsUnlocked(window.localStorage.getItem(`sitescore-unlocked-${shortId}`) === 'true')
       })
@@ -76,8 +85,7 @@ function App() {
     setIsSubmittingEmail(true)
     try {
       const response = await fetch(`${API_BASE}/api/reports/${audit.share_id}/lead`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: email.trim() }) })
-      const body = await response.json()
-      if (!response.ok) throw new Error(body.detail ?? 'We could not save your email.')
+      await readApiResponse(response)
       setIsUnlocked(true)
       window.localStorage.setItem(`sitescore-unlocked-${audit.share_id}`, 'true')
     } catch (requestError) {
@@ -124,8 +132,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: normalized }),
       })
-      const body = await response.json()
-      if (!response.ok) throw new Error(body.detail ?? 'The crawl could not be completed.')
+      const body = await readApiResponse(response)
       setAudit(body)
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Something went wrong while crawling that site.')
