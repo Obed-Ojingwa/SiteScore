@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, HttpUrl
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.pool import NullPool
 
 
 app = FastAPI(title="SiteScore API", version="0.1.0")
@@ -28,7 +29,11 @@ if database_url:
     if "sslmode" not in parsed_database_url.query:
         database_url = str(parsed_database_url.update_query_dict({"sslmode": "require"}))
 logger = logging.getLogger("uvicorn.error")
-engine = create_engine(database_url, pool_pre_ping=True) if database_url else None
+engine_options = {"pool_pre_ping": True}
+if database_url and ".pooler.supabase.com" in database_url:
+    # Supabase transaction pooler connections must not be held by SQLAlchemy.
+    engine_options.update({"poolclass": NullPool, "connect_args": {"prepare_threshold": 0}})
+engine = create_engine(database_url, **engine_options) if database_url else None
 
 allowed_origins = [
     origin.strip()
