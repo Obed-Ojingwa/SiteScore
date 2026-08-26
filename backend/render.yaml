@@ -10,5 +10,7 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: SUPABASE_URL
+        sync: false
       - key: PUBLIC_API_URL
         sync: false

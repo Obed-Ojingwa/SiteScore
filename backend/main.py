@@ -325,13 +325,19 @@ def meta_value(soup: BeautifulSoup, name: str) -> str | None:
 async def health() -> dict[str, str]:
     if engine is None:
         return {"status": "ok", "database": "not_configured"}
+    database = make_url(database_url) if database_url else None
+    connection_info = {
+        "database_host": database.host or "unknown",
+        "database_port": str(database.port or "default"),
+        "database_user": database.username or "unknown",
+    }
     try:
         with engine.connect() as connection:
             connection.execute(text("select 1"))
-        return {"status": "ok", "database": "connected"}
+        return {"status": "ok", "database": "connected", **connection_info}
     except Exception:
         logger.exception("Database health check failed")
-        return {"status": "degraded", "database": "unavailable"}
+        return {"status": "degraded", "database": "unavailable", **connection_info}
 
 
 @app.get("/api/reports/{short_id}", response_model=AuditResponse)
