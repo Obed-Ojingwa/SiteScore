@@ -21,19 +21,28 @@ from sqlalchemy.pool import NullPool
 
 
 app = FastAPI(title="SiteScore API", version="0.1.0")
-database_url = os.getenv("DATABASE_URL")
+database_url = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'") or None
 if database_url and database_url.startswith("postgresql://"):
     database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 if database_url:
     parsed_database_url = make_url(database_url)
+    if ".pooler.supabase.com" in (parsed_database_url.host or "") and parsed_database_url.username == "postgres":
+        supabase_host = urlparse(os.getenv("SUPABASE_URL", "")).hostname or ""
+        project_ref = supabase_host.split(".")[0]
+        if project_ref:
+            parsed_database_url = parsed_database_url.set(username=f"postgres.{project_ref}")
     if "sslmode" not in parsed_database_url.query:
-        database_url = str(parsed_database_url.update_query_dict({"sslmode": "require"}))
+        parsed_database_url = parsed_database_url.update_query_dict({"sslmode": "require"})
+    database_url = str(parsed_database_url)
 logger = logging.getLogger("uvicorn.error")
 engine_options = {"pool_pre_ping": True}
 if database_url and ".pooler.supabase.com" in database_url:
     # Supabase transaction pooler connections must not be held by SQLAlchemy.
     engine_options.update({"poolclass": NullPool, "connect_args": {"prepare_threshold": 0}})
 engine = create_engine(database_url, **engine_options) if database_url else None
+if database_url:
+    safe_database_url = make_url(database_url).set(password="***")
+    logger.info("Database configured: %s", safe_database_url.render_as_string(hide_password=False))
 
 allowed_origins = [
     origin.strip()
