@@ -26,11 +26,13 @@ if database_url and database_url.startswith("postgresql://"):
     database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 if database_url:
     parsed_database_url = make_url(database_url)
-    if ".pooler.supabase.com" in (parsed_database_url.host or "") and parsed_database_url.username == "postgres":
+    if ".pooler.supabase.com" in (parsed_database_url.host or ""):
         supabase_host = urlparse(os.getenv("SUPABASE_URL", "")).hostname or ""
         project_ref = supabase_host.split(".")[0]
         if project_ref:
             parsed_database_url = parsed_database_url.set(username=f"postgres.{project_ref}")
+        elif parsed_database_url.username == "postgres":
+            raise RuntimeError("SUPABASE_URL must be set when DATABASE_URL uses a Supabase pooler hostname")
     if "sslmode" not in parsed_database_url.query:
         parsed_database_url = parsed_database_url.update_query_dict({"sslmode": "require"})
     database_url = str(parsed_database_url)
