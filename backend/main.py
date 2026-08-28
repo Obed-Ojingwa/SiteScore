@@ -21,7 +21,8 @@ from sqlalchemy.pool import NullPool
 
 
 app = FastAPI(title="SiteScore API", version="0.1.0")
-database_url = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'") or None
+raw_database_url = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'") or None
+database_url = raw_database_url
 if database_url and database_url.startswith("postgresql://"):
     database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 if database_url:
@@ -328,18 +329,33 @@ async def health() -> dict[str, str]:
     if engine is None:
         return {"status": "ok", "database": "not_configured"}
     database = make_url(database_url) if database_url else None
+    raw_database = make_url(raw_database_url) if raw_database_url else None
     connection_info = {
         "database_host": database.host or "unknown",
         "database_port": str(database.port or "default"),
         "database_user": database.username or "unknown",
+        "raw_database_user": raw_database.username if raw_database else "unknown",
     }
+    try:
+        import psycopg
+
+        direct_url = database.set(drivername="postgresql").render_as_string(hide_password=False)
+        with psycopg.connect(direct_url, connect_timeout=8) as direct_connection:
+            direct_connection.execute("select 1")
+        connection_info["psycopg"] = "connected"
+    except Exception:
+        logger.exception("Direct psycopg database health check failed")
+        connection_info["psycopg"] = "unavailable"
     try:
         with engine.connect() as connection:
             connection.execute(text("select 1"))
+        connection_info["sqlalchemy"] = "connected"
+        if connection_info["psycopg"] != "connected":
+            return {"status": "degraded", "database": "unavailable", **connection_info}
         return {"status": "ok", "database": "connected", **connection_info}
     except Exception:
         logger.exception("Database health check failed")
-        return {"status": "degraded", "database": "unavailable", **connection_info}
+        return {"status": "degraded", "database": "unavailable", "sqlalchemy": "unavailable", **connection_info}
 
 
 @app.get("/api/reports/{short_id}", response_model=AuditResponse)
