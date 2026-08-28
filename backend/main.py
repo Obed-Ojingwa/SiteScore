@@ -22,7 +22,7 @@ from sqlalchemy.pool import NullPool
 
 
 app = FastAPI(title="SiteScore API", version="0.1.0")
-raw_database_url = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'") or None
+raw_database_url = "postgresql://postgres.zregwlxtvqwqmsgitatk:tntopbvbcds@aws-0-eu-central-1.pooler.supabase.com:6543/postgres"   # os.getenv("DATABASE_URL", "").strip().strip('"').strip("'") or None
 database_url = raw_database_url
 if database_url and database_url.startswith("postgresql://"):
     database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
