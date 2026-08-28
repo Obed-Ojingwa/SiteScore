@@ -6,6 +6,7 @@ import html
 import secrets
 import io
 import logging
+import hashlib
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -344,6 +345,9 @@ async def health() -> dict[str, str]:
         "database_user": database.username or "unknown",
         "raw_database_user": raw_database.username if raw_database else "unknown",
     }
+    if database.password is not None:
+        connection_info["database_password_length"] = str(len(database.password))
+        connection_info["database_password_sha256_8"] = hashlib.sha256(database.password.encode()).hexdigest()[:8]
     try:
         import psycopg
 
