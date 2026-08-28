@@ -22,12 +22,14 @@ from sqlalchemy.pool import NullPool
 
 
 app = FastAPI(title="SiteScore API", version="0.1.0")
-raw_database_url = "postgres.zregwlxtvqwqmsgitatk:tntopbvbcds@aws-0-eu-central-1.pooler.supabase.com:6543/postgres"   # os.getenv("DATABASE_URL", "").strip().strip('"').strip("'") or None
+raw_database_url = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'") or None
 database_url = raw_database_url
 if database_url and database_url.startswith("postgresql://"):
     database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 if database_url:
     parsed_database_url = make_url(database_url)
+    if parsed_database_url.host is None or parsed_database_url.username is None or parsed_database_url.password is None:
+        raise RuntimeError("DATABASE_URL must be a complete PostgreSQL URL with username and password")
     if ".pooler.supabase.com" in (parsed_database_url.host or ""):
         supabase_host = urlparse(os.getenv("SUPABASE_URL", "")).hostname or ""
         project_ref = supabase_host.split(".")[0]
