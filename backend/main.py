@@ -41,7 +41,15 @@ logger = logging.getLogger("uvicorn.error")
 engine_options = {"pool_pre_ping": True}
 if database_url and ".pooler.supabase.com" in database_url:
     # Supabase transaction pooler connections must not be held by SQLAlchemy.
-    engine_options.update({"poolclass": NullPool, "connect_args": {"prepare_threshold": 0}})
+    pooler_url = make_url(database_url)
+    engine_options.update({
+        "poolclass": NullPool,
+        "connect_args": {
+            "prepare_threshold": 0,
+            "user": pooler_url.username,
+            "password": pooler_url.password,
+        },
+    })
 engine = create_engine(database_url, **engine_options) if database_url else None
 if database_url:
     safe_database_url = make_url(database_url).set(password="***")
@@ -340,7 +348,12 @@ async def health() -> dict[str, str]:
         import psycopg
 
         direct_url = database.set(drivername="postgresql").render_as_string(hide_password=False)
-        with psycopg.connect(direct_url, connect_timeout=8) as direct_connection:
+        with psycopg.connect(
+            direct_url,
+            user=database.username,
+            password=database.password,
+            connect_timeout=8,
+        ) as direct_connection:
             direct_connection.execute("select 1")
         connection_info["psycopg"] = "connected"
     except ImportError:
