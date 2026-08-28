@@ -343,9 +343,14 @@ async def health() -> dict[str, str]:
         with psycopg.connect(direct_url, connect_timeout=8) as direct_connection:
             direct_connection.execute("select 1")
         connection_info["psycopg"] = "connected"
-    except Exception:
+    except ImportError:
+        logger.exception("psycopg is not installed")
+        connection_info["psycopg"] = "not_installed"
+        connection_info["psycopg_error"] = "The psycopg package is not installed."
+    except Exception as exc:
         logger.exception("Direct psycopg database health check failed")
         connection_info["psycopg"] = "unavailable"
+        connection_info["psycopg_error"] = str(exc).split("\n", 1)[0][:240]
     try:
         with engine.connect() as connection:
             connection.execute(text("select 1"))
