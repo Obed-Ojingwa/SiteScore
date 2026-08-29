@@ -66,7 +66,8 @@ function App() {
       .then(async (response) => {
         const body = await readApiResponse(response)
         setAudit(body)
-        setIsUnlocked(window.localStorage.getItem(`sitescore-unlocked-${shortId}`) === 'true')
+        setEmail(window.localStorage.getItem(`sitescore-email-${shortId}`) ?? '')
+        setIsUnlocked(window.localStorage.getItem(`sitescore-unlocked-${shortId}`) === 'true' && Boolean(window.localStorage.getItem(`sitescore-email-${shortId}`)))
       })
       .catch((requestError) => setError(requestError instanceof Error ? requestError.message : 'That shared report could not be loaded.'))
       .finally(() => setIsLoading(false))
@@ -88,6 +89,7 @@ function App() {
       await readApiResponse(response)
       setIsUnlocked(true)
       window.localStorage.setItem(`sitescore-unlocked-${audit.share_id}`, 'true')
+      window.localStorage.setItem(`sitescore-email-${audit.share_id}`, email.trim())
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'We could not save your email.')
     } finally {
@@ -97,14 +99,23 @@ function App() {
 
   async function downloadPdf() {
     if (!audit?.share_id || !email.trim()) return
-    const response = await fetch(`${API_BASE}/api/reports/${audit.share_id}/pdf`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: email.trim() }) })
-    if (!response.ok) return
-    const blob = await response.blob()
-    const link = document.createElement('a')
-    link.href = URL.createObjectURL(blob)
-    link.download = `sitescore-${audit.share_id}.pdf`
-    link.click()
-    URL.revokeObjectURL(link.href)
+    setError('')
+    try {
+      const response = await fetch(`${API_BASE}/api/reports/${audit.share_id}/pdf`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: email.trim() }) })
+      if (!response.ok) {
+        await readApiResponse(response)
+      }
+      const blob = await response.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = `sitescore-${audit.share_id}.pdf`
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(objectUrl)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'The PDF could not be downloaded.')
+    }
   }
 
   async function handleSubmit(event: FormEvent) {

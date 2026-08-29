@@ -61,7 +61,7 @@ def ensure_schema() -> None:
     with engine.begin() as connection:
         if database_url.startswith("sqlite"):
             connection.execute(text("""
-                create table if not exists public.audit_reports (
+                create table if not exists audit_reports (
                     short_id text primary key,
                     url text not null,
                     final_url text not null,
@@ -72,7 +72,7 @@ def ensure_schema() -> None:
                 )
             """))
             connection.execute(text("""
-                create table if not exists public.lead_captures (
+                create table if not exists lead_captures (
                     report_short_id text not null,
                     email text not null,
                     primary key (report_short_id, email)
@@ -220,7 +220,7 @@ def persist_report(report: dict[str, Any]) -> str:
                 if str(database_url).startswith("sqlite"):
                     connection.execute(
                         text("""
-                            insert into public.audit_reports
+                            insert into audit_reports
                               (short_id, url, final_url, domain, overall_score, grade, report)
                             values (:short_id, :url, :final_url, :domain, :overall_score, :grade, :report)
                         """),
@@ -263,7 +263,7 @@ def load_report(short_id: str) -> dict[str, Any]:
     if engine is None:
         raise HTTPException(status_code=503, detail="Report storage is not configured on the API.")
     with engine.connect() as connection:
-        row = connection.execute(text("select report from public.audit_reports where short_id = :short_id"), {"short_id": short_id}).mappings().first()
+        row = connection.execute(text("select report from audit_reports where short_id = :short_id"), {"short_id": short_id}).mappings().first()
     if row is None:
         raise HTTPException(status_code=404, detail="That shared report does not exist.")
     report = row["report"]
@@ -279,7 +279,7 @@ def capture_lead(short_id: str, email: str) -> None:
         with engine.begin() as connection:
             connection.execute(
                 text("""
-                    insert into public.lead_captures (report_short_id, email)
+                    insert into lead_captures (report_short_id, email)
                     values (:short_id, :email)
                     on conflict (report_short_id, email) do nothing
                 """),
@@ -294,7 +294,7 @@ def lead_has_access(short_id: str, email: str) -> bool:
         return False
     with engine.connect() as connection:
         return connection.execute(
-            text("select 1 from public.lead_captures where report_short_id = :short_id and email = :email"),
+            text("select 1 from lead_captures where report_short_id = :short_id and email = :email"),
             {"short_id": short_id, "email": email.lower()},
         ).first() is not None
 
@@ -355,14 +355,19 @@ def build_pdf(report: dict[str, Any]) -> bytes:
     buffer = io.BytesIO()
     document = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=0.7 * inch, leftMargin=0.7 * inch, topMargin=0.65 * inch, bottomMargin=0.65 * inch)
     styles = getSampleStyleSheet()
-    story = [Paragraph("SiteScore report", styles["Title"]), Paragraph(f"{report['final_url']} · Grade {report['grade']} · {report['overall_score']}/100", styles["Heading2"]), Spacer(1, 0.2 * inch)]
+    final_url = html.escape(str(report.get("final_url", "")))
+    grade = html.escape(str(report.get("grade", "")))
+    story = [Paragraph("SiteScore report", styles["Title"]), Paragraph(f"{final_url} - Grade {grade} - {report.get('overall_score', 0)}/100", styles["Heading2"]), Spacer(1, 0.2 * inch)]
     story.append(Paragraph("Priority fixes", styles["Heading2"]))
     for index, issue in enumerate(report.get("issues", []), 1):
-        story.extend([Paragraph(f"{index}. {issue['title']} ({issue['category']})", styles["Heading3"]), Paragraph(issue["explanation"], styles["BodyText"])])
+        title = html.escape(str(issue.get("title", "Untitled issue")))
+        category = html.escape(str(issue.get("category", "General")))
+        explanation = html.escape(str(issue.get("explanation", "")))
+        story.extend([Paragraph(f"{index}. {title} ({category})", styles["Heading3"]), Paragraph(explanation, styles["BodyText"])])
     story.append(Spacer(1, 0.2 * inch))
     story.append(Paragraph("Raw crawl signals", styles["Heading2"]))
     for label, value in (("Title", report.get("title") or "Not found"), ("Meta description", report.get("meta_description") or "Not found"), ("H1 count", str(len(report.get("h1_tags", [])))), ("Page weight", f"{report.get('page_weight_bytes', 0):,} bytes"), ("Images missing alt", str(report.get("images_missing_alt", 0)))):
-        story.append(Paragraph(f"<b>{html.escape(label)}:</b> {html.escape(value)}", styles["BodyText"]))
+        story.append(Paragraph(f"<b>{html.escape(label)}:</b> {html.escape(str(value))}", styles["BodyText"]))
     document.build(story)
     return buffer.getvalue()
 
