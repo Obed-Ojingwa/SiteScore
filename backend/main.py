@@ -4,6 +4,7 @@ import os
 import re
 import html
 import json
+import base64
 import secrets
 import io
 import logging
@@ -292,6 +293,50 @@ def lead_has_access(short_id: str, email: str) -> bool:
         ).first() is not None
 
 
+async def send_unlock_email(short_id: str, email: str, report: dict[str, Any]) -> None:
+    resend_api_key = os.getenv("RESEND_API_KEY", "").strip()
+    from_email = os.getenv("RESEND_FROM_EMAIL", "").strip()
+    if not resend_api_key or not from_email:
+        raise HTTPException(status_code=503, detail="Email delivery is not configured on the API.")
+
+    report_link = f"{frontend_url()}/r/{short_id}"
+    domain = html.escape(urlparse(report["final_url"]).netloc)
+    issue_rows = "".join(
+        f"<li><strong>{html.escape(issue['title'])}</strong><br>{html.escape(issue['explanation'])}</li>"
+        for issue in report.get("issues", [])[:5]
+    )
+    payload = {
+        "from": from_email,
+        "to": [email],
+        "subject": f"Your SiteScore report for {domain}",
+        "html": f"""
+            <h1>Your SiteScore report</h1>
+            <p><strong>{domain}</strong> scored <strong>{report['overall_score']}/100</strong> (grade {html.escape(report['grade'])}).</p>
+            <h2>Priority fixes</h2>
+            <ol>{issue_rows or '<li>No priority issues were found.</li>'}</ol>
+            <p><a href="{html.escape(report_link)}">Open your full report</a></p>
+            <p>Your PDF report is attached to this email.</p>
+        """,
+        "attachments": [{
+            "filename": f"sitescore-{short_id}.pdf",
+            "content": base64.b64encode(build_pdf(report)).decode("ascii"),
+        }],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {resend_api_key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+        if response.is_error:
+            logger.error("Resend rejected unlock email: HTTP %s", response.status_code)
+            raise HTTPException(status_code=502, detail="Your email could not be delivered. Please try again.")
+    except httpx.HTTPError as exc:
+        logger.warning("Resend request failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Your email could not be delivered. Please try again.") from exc
+
+
 def build_pdf(report: dict[str, Any]) -> bytes:
     try:
         from reportlab.lib.pagesizes import letter
@@ -521,8 +566,10 @@ async def create_lead(short_id: str, request: LeadCaptureRequest, http_request: 
     client_ip = http_request.client.host if http_request.client else "unknown"
     if rate_limit_exceeded(client_ip, limit=10, window_seconds=60):
         raise HTTPException(status_code=429, detail="Too many lead submissions from this IP. Please wait a minute and try again.")
-    load_report(short_id)
-    capture_lead(short_id, str(request.email))
+    report = load_report(short_id)
+    email = str(request.email).lower()
+    capture_lead(short_id, email)
+    await send_unlock_email(short_id, email, report)
     return LeadCaptureResponse(success=True, message="Your detailed fixes are unlocked.")
 
 
