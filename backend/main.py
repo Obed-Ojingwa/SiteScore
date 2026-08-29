@@ -41,7 +41,7 @@ if database_url and database_url.startswith("postgresql"):
         supabase_host = urlparse(os.getenv("SUPABASE_URL", "")).hostname or ""
         project_ref = supabase_host.split(".")[0]
         if project_ref:
-            parsed_database_url = parsed_database_url.set(username="postgres", host=f"db.{project_ref}.supabase.co", port=5432)
+            parsed_database_url = parsed_database_url.set(username=f"postgres.{project_ref}")
         elif parsed_database_url.username == "postgres":
             raise RuntimeError("SUPABASE_URL must be set when DATABASE_URL uses a Supabase pooler hostname")
 
