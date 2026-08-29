@@ -545,7 +545,7 @@ async def health() -> dict[str, str]:
         "database_host": database.host or "unknown",
         "database_port": str(database.port or "default"),
         "database_user": database.username or "unknown",
-        "resend_configured": bool(os.getenv("RESEND_API_KEY", "").strip()) and bool(os.getenv("RESEND_FROM_EMAIL", "").strip())
+    
     }
     try:
         with engine.connect() as connection:
