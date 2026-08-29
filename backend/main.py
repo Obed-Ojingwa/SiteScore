@@ -263,7 +263,8 @@ def load_report(short_id: str) -> dict[str, Any]:
     if engine is None:
         raise HTTPException(status_code=503, detail="Report storage is not configured on the API.")
     with engine.connect() as connection:
-        row = connection.execute(text("select report from audit_reports where short_id = :short_id"), {"short_id": short_id}).mappings().first()
+        table = "audit_reports" if str(database_url).startswith("sqlite") else "public.audit_reports"
+        row = connection.execute(text(f"select report from {table} where short_id = :short_id"), {"short_id": short_id}).mappings().first()
     if row is None:
         raise HTTPException(status_code=404, detail="That shared report does not exist.")
     report = row["report"]
@@ -277,15 +278,26 @@ def capture_lead(short_id: str, email: str) -> None:
         raise HTTPException(status_code=503, detail="Report storage is not configured on the API.")
     try:
         with engine.begin() as connection:
-            connection.execute(
-                text("""
-                    insert into lead_captures (report_short_id, email)
-                    values (:short_id, :email)
-                    on conflict (report_short_id, email) do nothing
-                """),
+            table = "lead_captures" if str(database_url).startswith("sqlite") else "public.lead_captures"
+            # Manual check-then-insert instead of ON CONFLICT: ON CONFLICT requires a
+            # unique constraint to already exist on the live table, and "create table
+            # if not exists" silently no-ops if the table was created earlier under a
+            # different schema version -- it does NOT retroactively add a missing
+            # constraint. This approach works regardless of the table's constraint state.
+            already_exists = connection.execute(
+                text(f"select 1 from {table} where report_short_id = :short_id and email = :email"),
                 {"short_id": short_id, "email": email.lower()},
-            )
+            ).first() is not None
+            if not already_exists:
+                connection.execute(
+                    text(f"""
+                        insert into {table} (report_short_id, email)
+                        values (:short_id, :email)
+                    """),
+                    {"short_id": short_id, "email": email.lower()},
+                )
     except Exception as exc:
+        logger.exception("Could not capture lead")
         raise HTTPException(status_code=503, detail="Your email could not be saved. Please try again.") from exc
 
 
@@ -293,8 +305,9 @@ def lead_has_access(short_id: str, email: str) -> bool:
     if engine is None:
         return False
     with engine.connect() as connection:
+        table = "lead_captures" if str(database_url).startswith("sqlite") else "public.lead_captures"
         return connection.execute(
-            text("select 1 from lead_captures where report_short_id = :short_id and email = :email"),
+            text(f"select 1 from {table} where report_short_id = :short_id and email = :email"),
             {"short_id": short_id, "email": email.lower()},
         ).first() is not None
 
@@ -336,7 +349,7 @@ async def send_unlock_email(short_id: str, email: str, report: dict[str, Any]) -
                 json=payload,
             )
         if response.is_error:
-            logger.error("Resend rejected unlock email: HTTP %s", response.status_code)
+            logger.error("Resend rejected unlock email: HTTP %s body=%s", response.status_code, response.text[:500])
             raise HTTPException(status_code=502, detail="Your email could not be delivered. Please try again.")
     except httpx.HTTPError as exc:
         logger.warning("Resend request failed: %s", exc)
@@ -350,6 +363,7 @@ def build_pdf(report: dict[str, Any]) -> bytes:
         from reportlab.lib.units import inch
         from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
     except ImportError as exc:
+        logger.exception("reportlab import failed")
         raise HTTPException(status_code=503, detail="PDF generation is not available on the API.") from exc
 
     buffer = io.BytesIO()
@@ -541,23 +555,6 @@ def meta_value(soup: BeautifulSoup, name: str) -> str | None:
     return tag.get("content", "").strip() if tag else None
 
 
-# @app.get("/api/health")
-# async def health() -> dict[str, str] bool]:
-#     if engine is None:
-#         return {"status": "ok", "database": "not_configured"}
-#     database = make_url(database_url) if database_url else None
-#     connection_info = {
-#         "database_host": database.host or "unknown",
-#         "database_port": str(database.port or "default"),
-#         "database_user": database.username or "unknown",
-#         "resend_configured": (
-#             bool(os.getenv("RESEND_API_KEY", "").strip())
-#             and bool(os.getenv("RESEND_FROM_EMAIL", "").strip())
-#         ),
-    
-#     }
-
-
 @app.get("/api/health")
 async def health() -> dict[str, str | bool]:
     if engine is None:
@@ -733,6 +730,752 @@ async def audit_site(request: AuditRequest, http_request: Request) -> AuditRespo
     )
     share_id = persist_report(report.model_dump())
     return AuditResponse(**{**report.model_dump(), **report_urls(share_id)})
+
+
+
+
+
+
+
+
+
+
+
+# from __future__ import annotations
+
+# import os
+# import re
+# import html
+# import json
+# import base64
+# import secrets
+# import io
+# import logging
+# import time
+# from collections import defaultdict
+# from dataclasses import dataclass
+# from typing import Any
+# from urllib.parse import urljoin, urlparse
+
+# import httpx
+# from bs4 import BeautifulSoup
+# from fastapi import FastAPI, HTTPException, Request, Response
+# from PIL import Image, ImageDraw, ImageFont
+# from fastapi.middleware.cors import CORSMiddleware
+# from pydantic import BaseModel, EmailStr, HttpUrl
+# from sqlalchemy import create_engine, text
+# from sqlalchemy.engine import make_url
+# from sqlalchemy.pool import NullPool
+
+
+# app = FastAPI(title="SiteScore API", version="0.1.0")
+
+# raw_database_url = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'") or None
+# database_url = raw_database_url or "sqlite:///./site_score.db"
+
+# if database_url.startswith("postgresql://"):
+#     database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+# if database_url and database_url.startswith("postgresql"):
+#     parsed_database_url = make_url(database_url)
+#     if parsed_database_url.host is None or parsed_database_url.username is None or parsed_database_url.password is None:
+#         raise RuntimeError("DATABASE_URL must be a complete PostgreSQL URL with username and password")
+
+#     if ".pooler.supabase.com" in (parsed_database_url.host or ""):
+#         supabase_host = urlparse(os.getenv("SUPABASE_URL", "")).hostname or ""
+#         project_ref = supabase_host.split(".")[0]
+#         if project_ref:
+#             parsed_database_url = parsed_database_url.set(username=f"postgres.{project_ref}")
+#         elif parsed_database_url.username == "postgres":
+#             raise RuntimeError("SUPABASE_URL must be set when DATABASE_URL uses a Supabase pooler hostname")
+
+#     if "sslmode" not in parsed_database_url.query:
+#         parsed_database_url = parsed_database_url.update_query_dict({"sslmode": "require"})
+
+#     # BUG FIX: str(URL) masks the password by default in SQLAlchemy.
+#     # render_as_string(hide_password=False) is required to keep the real password.
+#     database_url = parsed_database_url.render_as_string(hide_password=False)
+
+
+
+# def ensure_schema() -> None:
+#     if engine is None:
+#         return
+#     with engine.begin() as connection:
+#         if database_url.startswith("sqlite"):
+#             connection.execute(text("""
+#                 create table if not exists audit_reports (
+#                     short_id text primary key,
+#                     url text not null,
+#                     final_url text not null,
+#                     domain text not null,
+#                     overall_score integer not null,
+#                     grade text not null,
+#                     report text not null
+#                 )
+#             """))
+#             connection.execute(text("""
+#                 create table if not exists lead_captures (
+#                     report_short_id text not null,
+#                     email text not null,
+#                     primary key (report_short_id, email)
+#                 )
+#             """))
+#         else:
+#             connection.execute(text("""
+#                 create table if not exists public.audit_reports (
+#                     short_id text primary key,
+#                     url text not null,
+#                     final_url text not null,
+#                     domain text not null,
+#                     overall_score integer not null,
+#                     grade text not null,
+#                     report jsonb not null
+#                 )
+#             """))
+#             connection.execute(text("""
+#                 create table if not exists public.lead_captures (
+#                     report_short_id text not null,
+#                     email text not null,
+#                     primary key (report_short_id, email)
+#                 )
+#             """))
+
+
+# logger = logging.getLogger("uvicorn.error")
+
+# engine_options = {"pool_pre_ping": True}
+# if database_url and ".pooler.supabase.com" in database_url:
+#     # Supabase transaction pooler connections must not be held by SQLAlchemy, and the
+#     # pooler can reject duplicate prepared statements when a connection is reused.
+#     pooler_url = make_url(database_url)
+#     engine_options.update({
+#         "poolclass": NullPool,
+#         "connect_args": {
+#             # None disables server-side prepared statements entirely. This is required
+#             # for Supavisor's transaction pooler, which multiplexes many logical
+#             # connections onto a shared, rotating set of backend server processes.
+#             # prepare_threshold=0 does NOT mean "never prepare" in psycopg3 -- it means
+#             # "prepare eagerly on first execution", which is the worst setting here and
+#             # is what caused DuplicatePreparedStatement collisions across connections.
+#             "prepare_threshold": None,
+#             "sslmode": "require",
+#             "user": pooler_url.username,
+#             "password": pooler_url.password,
+#         },
+#     })
+
+# engine = create_engine(database_url, **engine_options) if database_url else None
+
+# if engine is not None:
+#     ensure_schema()
+
+# if database_url:
+#     if database_url.startswith("sqlite"):
+#         safe_database_url = database_url
+#     else:
+#         safe_database_url = make_url(database_url).render_as_string(hide_password=True)
+#     logger.info("Database configured: %s", safe_database_url)
+
+# allowed_origins = [
+#     origin.strip()
+#     for origin in os.getenv("FRONTEND_URL", "https://site-score-sable.vercel.app").split(",")
+#     if origin.strip()
+# ]
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=allowed_origins,
+#     allow_credentials=True,
+#     allow_methods=["GET", "POST"],
+#     allow_headers=["*"],
+# )
+
+
+# class AuditRequest(BaseModel):
+#     url: HttpUrl
+
+
+# class AuditResponse(BaseModel):
+#     url: str
+#     final_url: str
+#     status_code: int
+#     title: str | None
+#     meta_description: str | None
+#     h1_tags: list[str]
+#     robots_txt: dict[str, Any]
+#     sitemap_xml: dict[str, Any]
+#     viewport_meta: dict[str, Any]
+#     is_https: bool
+#     images_missing_alt: int
+#     images_total: int
+#     json_ld: list[Any]
+#     page_weight_bytes: int
+#     has_sitewide_noindex: bool
+#     mixed_content_count: int
+#     scores: dict[str, int]
+#     overall_score: int
+#     grade: str
+#     issues: list[dict[str, Any]]
+#     share_id: str | None = None
+#     share_url: str | None = None
+#     og_image_url: str | None = None
+
+
+# class LeadCaptureRequest(BaseModel):
+#     email: EmailStr
+
+
+# class LeadCaptureResponse(BaseModel):
+#     success: bool
+#     message: str
+
+
+# rate_limit_store: dict[str, list[float]] = defaultdict(list)
+
+
+# def rate_limit_exceeded(client_ip: str, *, limit: int, window_seconds: int) -> bool:
+#     now = time.monotonic()
+#     events = rate_limit_store[client_ip]
+#     rate_limit_store[client_ip] = [event for event in events if now - event < window_seconds]
+#     if len(rate_limit_store[client_ip]) >= limit:
+#         return True
+#     rate_limit_store[client_ip].append(now)
+#     return False
+
+
+# def public_api_url() -> str:
+#     return os.getenv("PUBLIC_API_URL", "http://localhost:8000").rstrip("/")
+
+
+# def frontend_url() -> str:
+#     return os.getenv("FRONTEND_URL", "http://localhost:5173").split(",")[0].strip().rstrip("/")
+
+
+# def persist_report(report: dict[str, Any]) -> str:
+#     if engine is None:
+#         raise HTTPException(status_code=503, detail="Report storage is not configured on the API.")
+
+#     for _ in range(5):
+#         short_id = secrets.token_urlsafe(7).replace("-", "_")[:10]
+#         try:
+#             payload = json.dumps(report)
+#             with engine.begin() as connection:
+#                 if str(database_url).startswith("sqlite"):
+#                     connection.execute(
+#                         text("""
+#                             insert into audit_reports
+#                               (short_id, url, final_url, domain, overall_score, grade, report)
+#                             values (:short_id, :url, :final_url, :domain, :overall_score, :grade, :report)
+#                         """),
+#                         {
+#                             "short_id": short_id,
+#                             "url": report["url"],
+#                             "final_url": report["final_url"],
+#                             "domain": urlparse(report["final_url"]).netloc,
+#                             "overall_score": report["overall_score"],
+#                             "grade": report["grade"],
+#                             "report": payload,
+#                         },
+#                     )
+#                 else:
+#                     connection.execute(
+#                         text("""
+#                             insert into public.audit_reports
+#                               (short_id, url, final_url, domain, overall_score, grade, report)
+#                             values (:short_id, :url, :final_url, :domain, :overall_score, :grade, cast(:report as jsonb))
+#                         """),
+#                         {
+#                             "short_id": short_id,
+#                             "url": report["url"],
+#                             "final_url": report["final_url"],
+#                             "domain": urlparse(report["final_url"]).netloc,
+#                             "overall_score": report["overall_score"],
+#                             "grade": report["grade"],
+#                             "report": payload,
+#                         },
+#                     )
+#             return short_id
+#         except Exception as exc:
+#             if "duplicate key" not in str(exc).lower():
+#                 logger.exception("Could not persist audit report")
+#                 raise HTTPException(status_code=503, detail="The audit was completed but could not be saved.") from exc
+#     raise HTTPException(status_code=503, detail="Could not create a unique share link. Please try again.")
+
+
+# def load_report(short_id: str) -> dict[str, Any]:
+#     if engine is None:
+#         raise HTTPException(status_code=503, detail="Report storage is not configured on the API.")
+#     with engine.connect() as connection:
+#         row = connection.execute(text("select report from audit_reports where short_id = :short_id"), {"short_id": short_id}).mappings().first()
+#     if row is None:
+#         raise HTTPException(status_code=404, detail="That shared report does not exist.")
+#     report = row["report"]
+#     if isinstance(report, str):
+#         return json.loads(report)
+#     return report
+
+
+# def capture_lead(short_id: str, email: str) -> None:
+#     if engine is None:
+#         raise HTTPException(status_code=503, detail="Report storage is not configured on the API.")
+#     try:
+#         with engine.begin() as connection:
+#             connection.execute(
+#                 text("""
+#                     insert into lead_captures (report_short_id, email)
+#                     values (:short_id, :email)
+#                     on conflict (report_short_id, email) do nothing
+#                 """),
+#                 {"short_id": short_id, "email": email.lower()},
+#             )
+#     except Exception as exc:
+#         raise HTTPException(status_code=503, detail="Your email could not be saved. Please try again.") from exc
+
+
+# def lead_has_access(short_id: str, email: str) -> bool:
+#     if engine is None:
+#         return False
+#     with engine.connect() as connection:
+#         return connection.execute(
+#             text("select 1 from lead_captures where report_short_id = :short_id and email = :email"),
+#             {"short_id": short_id, "email": email.lower()},
+#         ).first() is not None
+
+
+# async def send_unlock_email(short_id: str, email: str, report: dict[str, Any]) -> None:
+#     resend_api_key = os.getenv("RESEND_API_KEY", "").strip()
+#     from_email = os.getenv("RESEND_FROM_EMAIL", "").strip()
+#     if not resend_api_key or not from_email:
+#         raise HTTPException(status_code=503, detail="Email delivery is not configured on the API.")
+
+#     report_link = f"{frontend_url()}/r/{short_id}"
+#     domain = html.escape(urlparse(report["final_url"]).netloc)
+#     issue_rows = "".join(
+#         f"<li><strong>{html.escape(issue['title'])}</strong><br>{html.escape(issue['explanation'])}</li>"
+#         for issue in report.get("issues", [])[:5]
+#     )
+#     payload = {
+#         "from": from_email,
+#         "to": [email],
+#         "subject": f"Your SiteScore report for {domain}",
+#         "html": f"""
+#             <h1>Your SiteScore report</h1>
+#             <p><strong>{domain}</strong> scored <strong>{report['overall_score']}/100</strong> (grade {html.escape(report['grade'])}).</p>
+#             <h2>Priority fixes</h2>
+#             <ol>{issue_rows or '<li>No priority issues were found.</li>'}</ol>
+#             <p><a href="{html.escape(report_link)}">Open your full report</a></p>
+#             <p>Your PDF report is attached to this email.</p>
+#         """,
+#         "attachments": [{
+#             "filename": f"sitescore-{short_id}.pdf",
+#             "content": base64.b64encode(build_pdf(report)).decode("ascii"),
+#         }],
+#     }
+#     try:
+#         async with httpx.AsyncClient(timeout=10) as client:
+#             response = await client.post(
+#                 "https://api.resend.com/emails",
+#                 headers={"Authorization": f"Bearer {resend_api_key}", "Content-Type": "application/json"},
+#                 json=payload,
+#             )
+#         if response.is_error:
+#             logger.error("Resend rejected unlock email: HTTP %s", response.status_code)
+#             raise HTTPException(status_code=502, detail="Your email could not be delivered. Please try again.")
+#     except httpx.HTTPError as exc:
+#         logger.warning("Resend request failed: %s", exc)
+#         raise HTTPException(status_code=502, detail="Your email could not be delivered. Please try again.") from exc
+
+
+# def build_pdf(report: dict[str, Any]) -> bytes:
+#     try:
+#         from reportlab.lib.pagesizes import letter
+#         from reportlab.lib.styles import getSampleStyleSheet
+#         from reportlab.lib.units import inch
+#         from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+#     except ImportError as exc:
+#         raise HTTPException(status_code=503, detail="PDF generation is not available on the API.") from exc
+
+#     buffer = io.BytesIO()
+#     document = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=0.7 * inch, leftMargin=0.7 * inch, topMargin=0.65 * inch, bottomMargin=0.65 * inch)
+#     styles = getSampleStyleSheet()
+#     final_url = html.escape(str(report.get("final_url", "")))
+#     grade = html.escape(str(report.get("grade", "")))
+#     story = [Paragraph("SiteScore report", styles["Title"]), Paragraph(f"{final_url} - Grade {grade} - {report.get('overall_score', 0)}/100", styles["Heading2"]), Spacer(1, 0.2 * inch)]
+#     story.append(Paragraph("Priority fixes", styles["Heading2"]))
+#     for index, issue in enumerate(report.get("issues", []), 1):
+#         title = html.escape(str(issue.get("title", "Untitled issue")))
+#         category = html.escape(str(issue.get("category", "General")))
+#         explanation = html.escape(str(issue.get("explanation", "")))
+#         story.extend([Paragraph(f"{index}. {title} ({category})", styles["Heading3"]), Paragraph(explanation, styles["BodyText"])])
+#     story.append(Spacer(1, 0.2 * inch))
+#     story.append(Paragraph("Raw crawl signals", styles["Heading2"]))
+#     for label, value in (("Title", report.get("title") or "Not found"), ("Meta description", report.get("meta_description") or "Not found"), ("H1 count", str(len(report.get("h1_tags", [])))), ("Page weight", f"{report.get('page_weight_bytes', 0):,} bytes"), ("Images missing alt", str(report.get("images_missing_alt", 0)))):
+#         story.append(Paragraph(f"<b>{html.escape(label)}:</b> {html.escape(str(value))}", styles["BodyText"]))
+#     document.build(story)
+#     return buffer.getvalue()
+
+
+# def report_urls(short_id: str) -> dict[str, str]:
+#     base = public_api_url()
+#     return {"share_id": short_id, "share_url": f"{base}/r/{short_id}", "og_image_url": f"{base}/api/reports/{short_id}/og.png"}
+
+
+# def build_og_image(report: dict[str, Any]) -> bytes:
+#     width, height = 1200, 630
+#     image = Image.new("RGB", (width, height), "#07162e")
+#     draw = ImageDraw.Draw(image)
+
+#     for y in range(height):
+#         ratio = y / height
+#         r = int(7 + (25 - 7) * ratio)
+#         g = int(18 + (49 - 18) * ratio)
+#         b = int(36 + (81 - 36) * ratio)
+#         draw.line((0, y, width, y), fill=(r, g, b))
+
+#     glow = (12, 28, 58)
+#     draw.ellipse((820, -120, 1260, 360), fill=glow)
+#     draw.rounded_rectangle((70, 70, 1125, 540), radius=26, fill=(13, 23, 38, 200), outline=(40, 74, 128), width=2)
+#     draw.rounded_rectangle((780, 170, 1080, 430), radius=24, fill=(119, 225, 181, 28), outline=(119, 225, 181), width=2)
+
+#     try:
+#         tag_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+#         domain_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 46)
+#         score_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 136)
+#         grade_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 180)
+#         body_font = ImageFont.truetype("DejaVuSans.ttf", 26)
+#     except OSError:
+#         tag_font = ImageFont.load_default()
+#         domain_font = ImageFont.load_default()
+#         score_font = ImageFont.load_default()
+#         grade_font = ImageFont.load_default()
+#         body_font = ImageFont.load_default()
+
+#     domain = urlparse(report["final_url"]).netloc or "example.com"
+#     grade = str(report["grade"])
+#     score = str(report["overall_score"])
+
+#     draw.text((90, 105), "SiteScore", font=tag_font, fill=(119, 225, 181))
+#     draw.text((90, 190), "SEO REPORT", font=body_font, fill=(157, 177, 205))
+#     draw.text((90, 240), domain, font=domain_font, fill=(248, 251, 255))
+#     draw.text((90, 475), "overall score", font=body_font, fill=(157, 177, 205))
+#     draw.text((810, 180), grade, font=grade_font, fill=(119, 225, 181))
+#     draw.text((855, 370), score, font=score_font, fill=(248, 251, 255))
+#     draw.text((860, 490), "/ 100", font=body_font, fill=(157, 177, 205))
+
+#     buffer = io.BytesIO()
+#     image.save(buffer, format="PNG")
+#     return buffer.getvalue()
+
+
+# @dataclass
+# class ScoreIssue:
+#     category: str
+#     lost_points: int
+#     title: str
+#     explanation: str
+
+
+# def score_audit(
+#     *,
+#     title: str | None,
+#     meta_description: str | None,
+#     h1_tags: list[str],
+#     robots_exists: bool,
+#     robots_blocks_all: bool,
+#     sitemap_exists: bool,
+#     has_sitewide_noindex: bool,
+#     json_ld: list[Any],
+#     page_weight_bytes: int,
+#     images_missing_alt: int,
+#     images_total: int,
+#     is_https: bool,
+#     viewport_exists: bool,
+#     mixed_content_count: int,
+# ) -> tuple[dict[str, int], int, str, list[dict[str, Any]]]:
+#     issues: list[ScoreIssue] = []
+
+#     indexability_checks = [robots_exists and not robots_blocks_all, sitemap_exists, not has_sitewide_noindex]
+#     indexability = round(sum(indexability_checks) / len(indexability_checks) * 100)
+#     if not indexability_checks[0]:
+#         issues.append(ScoreIssue("Indexability", 20, "Review crawler access", "Make sure robots.txt exists and does not disallow all crawlers so search engines can access your site."))
+#     if not indexability_checks[1]:
+#         issues.append(ScoreIssue("Indexability", 20, "Add an XML sitemap", "Publish sitemap.xml and reference your important pages so search engines can discover them efficiently."))
+#     if not indexability_checks[2]:
+#         issues.append(ScoreIssue("Indexability", 20, "Remove sitewide noindex", "Remove the blanket noindex directive unless you intentionally want the whole site kept out of search results."))
+
+#     on_page_checks = [title is not None and 30 <= len(title) <= 60, meta_description is not None and 120 <= len(meta_description) <= 160, len(h1_tags) == 1]
+#     on_page = round(sum(on_page_checks) / len(on_page_checks) * 100)
+#     if not on_page_checks[0]:
+#         issues.append(ScoreIssue("On-page", 20, "Tune the title tag", "Add a descriptive title between 30 and 60 characters so searchers and crawlers understand the page quickly."))
+#     if not on_page_checks[1]:
+#         issues.append(ScoreIssue("On-page", 20, "Write a meta description", "Add a useful meta description between 120 and 160 characters to give the search result a clear preview."))
+#     if not on_page_checks[2]:
+#         issues.append(ScoreIssue("On-page", 20, "Use one clear H1", "Keep exactly one H1 that describes the page's primary topic and use lower-level headings for sections."))
+
+#     valid_json_ld = bool(json_ld) and all(not (isinstance(item, dict) and "_invalid" in item) for item in json_ld)
+#     structured_data = 100 if valid_json_ld else 0
+#     if not valid_json_ld:
+#         issues.append(ScoreIssue("Structured data", 20, "Add valid JSON-LD", "Add valid schema.org JSON-LD that describes the page so eligible search features can understand its content."))
+
+#     image_ratio = images_missing_alt / images_total if images_total else 0
+#     performance_checks = [page_weight_bytes < 2 * 1024 * 1024, image_ratio < 0.2]
+#     performance = round(sum(performance_checks) / len(performance_checks) * 100)
+#     if not performance_checks[0]:
+#         issues.append(ScoreIssue("Performance signals", 10, "Reduce page weight", "Keep the initial HTML response under 2 MB by compressing content and removing unnecessary payload."))
+#     if not performance_checks[1]:
+#         issues.append(ScoreIssue("Performance signals", 10, "Fill in image alt text", "Add concise alt text to images so their meaning is available to screen readers and crawlers."))
+
+#     security_checks = [is_https, viewport_exists, mixed_content_count == 0]
+#     security = round(sum(security_checks) / len(security_checks) * 100)
+#     if not security_checks[0]:
+#         issues.append(ScoreIssue("Security/mobile", 20, "Enable HTTPS", "Serve the site over HTTPS to protect visitors and preserve trust in the browser and search results."))
+#     if not security_checks[1]:
+#         issues.append(ScoreIssue("Security/mobile", 20, "Add a viewport meta tag", "Add a responsive viewport declaration so the page can size correctly on phones and tablets."))
+#     if not security_checks[2]:
+#         issues.append(ScoreIssue("Security/mobile", 20, "Fix mixed content", "Update HTTP assets to HTTPS so browsers do not block insecure resources on the secure page."))
+
+#     scores = {"indexability": indexability, "on_page": on_page, "structured_data": structured_data, "performance_signals": performance, "security_mobile": security}
+#     overall_score = round(sum(scores.values()) / len(scores))
+#     grade = "A" if overall_score >= 90 else "B" if overall_score >= 80 else "C" if overall_score >= 70 else "D" if overall_score >= 60 else "F"
+#     issues.sort(key=lambda issue: issue.lost_points, reverse=True)
+#     return scores, overall_score, grade, [issue.__dict__ for issue in issues[:5]]
+
+
+# def robots_blocks_all(content: str | None) -> bool:
+#     if not content:
+#         return False
+#     applies_to_all = False
+#     for line in content.splitlines():
+#         directive, _, value = line.partition(":")
+#         directive = directive.strip().lower()
+#         value = value.strip()
+#         if directive == "user-agent":
+#             applies_to_all = value == "*"
+#         elif directive == "disallow" and applies_to_all and value == "/":
+#             return True
+#     return False
+
+
+# async def fetch_optional(client: httpx.AsyncClient, url: str) -> tuple[bool, str | None, int | None]:
+#     try:
+#         response = await client.get(url)
+#         return response.is_success, response.text, response.status_code
+#     except httpx.HTTPError:
+#         return False, None, None
+
+
+# def extract_json_ld(soup: BeautifulSoup) -> list[Any]:
+#     values: list[Any] = []
+#     for script in soup.select('script[type="application/ld+json"]'):
+#         raw = script.string or script.get_text()
+#         if not raw.strip():
+#             continue
+#         try:
+#             import json
+
+#             values.append(json.loads(raw))
+#         except json.JSONDecodeError:
+#             values.append({"_invalid": raw.strip()})
+#     return values
+
+
+# def meta_value(soup: BeautifulSoup, name: str) -> str | None:
+#     tag = soup.find("meta", attrs={"name": re.compile(f"^{name}$", re.IGNORECASE)})
+#     return tag.get("content", "").strip() if tag else None
+
+
+# # @app.get("/api/health")
+# # async def health() -> dict[str, str] bool]:
+# #     if engine is None:
+# #         return {"status": "ok", "database": "not_configured"}
+# #     database = make_url(database_url) if database_url else None
+# #     connection_info = {
+# #         "database_host": database.host or "unknown",
+# #         "database_port": str(database.port or "default"),
+# #         "database_user": database.username or "unknown",
+# #         "resend_configured": (
+# #             bool(os.getenv("RESEND_API_KEY", "").strip())
+# #             and bool(os.getenv("RESEND_FROM_EMAIL", "").strip())
+# #         ),
+    
+# #     }
+
+
+# @app.get("/api/health")
+# async def health() -> dict[str, str | bool]:
+#     if engine is None:
+#         return {"status": "ok", "database": "not_configured"}
+
+#     database = make_url(database_url) if database_url else None
+
+#     connection_info = {
+#         "database_host": database.host or "unknown",
+#         "database_port": str(database.port or "default"),
+#         "database_user": database.username or "unknown",
+#         "resend_configured": (
+#             bool(os.getenv("RESEND_API_KEY", "").strip())
+#             and bool(os.getenv("RESEND_FROM_EMAIL", "").strip())
+#         ),
+#     }
+
+#     try:
+#         with engine.connect() as connection:
+#             connection.execute(text("select 1"))
+#         return {"status": "ok", "database": "connected", **connection_info}
+#     except Exception:
+#         logger.exception("Database health check failed")
+#         return {"status": "degraded", "database": "unavailable", **connection_info}
+
+
+# @app.get("/api/reports/{short_id}", response_model=AuditResponse)
+# async def get_report(short_id: str) -> AuditResponse:
+#     report = load_report(short_id)
+#     return AuditResponse(**{**report, **report_urls(short_id)})
+
+
+# @app.get("/api/reports/{short_id}/og.png")
+# async def report_og_image(short_id: str) -> Response:
+#     report = load_report(short_id)
+#     return Response(content=build_og_image(report), media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
+
+
+# @app.post("/api/reports/{short_id}/lead", response_model=LeadCaptureResponse)
+# async def create_lead(short_id: str, request: LeadCaptureRequest, http_request: Request) -> LeadCaptureResponse:
+#     client_ip = http_request.client.host if http_request.client else "unknown"
+#     if rate_limit_exceeded(client_ip, limit=10, window_seconds=60):
+#         raise HTTPException(status_code=429, detail="Too many lead submissions from this IP. Please wait a minute and try again.")
+#     report = load_report(short_id)
+#     email = str(request.email).lower()
+#     capture_lead(short_id, email)
+#     await send_unlock_email(short_id, email, report)
+#     return LeadCaptureResponse(success=True, message="Your detailed fixes are unlocked.")
+
+
+# @app.post("/api/reports/{short_id}/pdf")
+# async def download_pdf(short_id: str, request: LeadCaptureRequest, http_request: Request) -> Response:
+#     client_ip = http_request.client.host if http_request.client else "unknown"
+#     if rate_limit_exceeded(client_ip, limit=10, window_seconds=60):
+#         raise HTTPException(status_code=429, detail="Too many report downloads from this IP. Please wait a minute and try again.")
+#     report = load_report(short_id)
+#     if not lead_has_access(short_id, str(request.email)):
+#         raise HTTPException(status_code=403, detail="Submit your email before downloading the report.")
+#     return Response(content=build_pdf(report), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="sitescore-{short_id}.pdf"'})
+
+
+# @app.get("/r/{short_id}", response_class=Response)
+# async def shared_report(short_id: str) -> Response:
+#     report = load_report(short_id)
+#     urls = report_urls(short_id)
+#     title = html.escape(f"{report['grade']} grade for {urlparse(report['final_url']).netloc} | SiteScore")
+#     description = html.escape(f"SiteScore found an overall SEO score of {report['overall_score']}/100 for {urlparse(report['final_url']).netloc}.")
+#     domain = html.escape(urlparse(report['final_url']).netloc)
+#     destination = f"{frontend_url()}/r/{short_id}"
+#     page = f'''<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
+#             <meta name="description" content="{description}"><meta property="og:title" content="{title}">
+#             <meta property="og:description" content="{description}"><meta property="og:type" content="website">
+#             <meta property="og:url" content="{urls['share_url']}"><meta property="og:image" content="{urls['og_image_url']}">
+#             <meta property="og:image:type" content="image/png"><meta property="og:image:width" content="1200">
+#             <meta property="og:image:height" content="630"><meta property="og:image:alt" content="SiteScore report for {domain}">
+#             <meta property="og:site_name" content="SiteScore"><meta name="twitter:card" content="summary_large_image">
+#             <meta name="twitter:title" content="{title}"><meta name="twitter:description" content="{description}">
+#             <meta name="twitter:image" content="{urls['og_image_url']}"><meta name="twitter:image:alt" content="SiteScore report for {domain}">
+#             <meta http-equiv="refresh" content="0;url={destination}"></head>
+#             <body style="font-family:Arial,sans-serif;background:#07162e;color:white;padding:40px">Opening your SiteScore report...</body></html>'''
+#     return Response(content=page, media_type="text/html")
+
+
+# @app.post("/api/audit", response_model=AuditResponse)
+# async def audit_site(request: AuditRequest, http_request: Request) -> AuditResponse:
+#     client_ip = http_request.client.host if http_request.client else "unknown"
+#     if rate_limit_exceeded(client_ip, limit=5, window_seconds=60):
+#         raise HTTPException(status_code=429, detail="Too many audit requests from this IP. Please wait a minute and try again.")
+#     target_url = str(request.url)
+#     parsed = urlparse(target_url)
+#     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+#         raise HTTPException(status_code=422, detail="Enter a complete URL starting with http:// or https://.")
+
+#     headers = {"User-Agent": "SiteScoreBot/0.1 (+https://sitescore.app)"}
+#     timeout = httpx.Timeout(15.0, connect=8.0)
+#     try:
+#         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
+#             response = await client.get(target_url)
+#             response.raise_for_status()
+#             html = response.text
+#             soup = BeautifulSoup(html, "html.parser")
+#             final_parsed = urlparse(str(response.url))
+#             origin = f"{final_parsed.scheme}://{final_parsed.netloc}"
+#             robots_ok, robots_body, robots_status = await fetch_optional(client, urljoin(origin + "/", "robots.txt"))
+#             sitemap_ok, _, sitemap_status = await fetch_optional(client, urljoin(origin + "/", "sitemap.xml"))
+#     except httpx.InvalidURL as exc:
+#         raise HTTPException(status_code=422, detail="That URL is not valid. Check it and try again.") from exc
+#     except httpx.HTTPStatusError as exc:
+#         raise HTTPException(status_code=502, detail=f"The site returned HTTP {exc.response.status_code}.") from exc
+#     except httpx.HTTPError as exc:
+#         raise HTTPException(status_code=504, detail="The site could not be reached within 15 seconds.") from exc
+
+#     images = soup.find_all("img")
+#     missing_alt = sum(1 for image in images if not image.get("alt", "").strip())
+#     viewport = soup.find("meta", attrs={"name": re.compile("^viewport$", re.IGNORECASE)})
+#     final_url = str(response.url)
+#     title = soup.title.get_text(strip=True) if soup.title else None
+#     meta_description = meta_value(soup, "description")
+#     h1_tags = [heading.get_text(" ", strip=True) for heading in soup.find_all("h1")]
+#     json_ld = extract_json_ld(soup)
+#     has_sitewide_noindex = any(
+#         directive in {"noindex", "none"}
+#         for tag in soup.find_all("meta", attrs={"name": re.compile("^robots$", re.IGNORECASE)})
+#         for directive in re.split(r"[,\s]+", tag.get("content", "").lower())
+#     )
+#     mixed_content_count = sum(
+#         1
+#         for tag in soup.find_all(src=True)
+#         if str(tag.get("src", "")).lower().startswith("http://")
+#     ) + sum(
+#         1
+#         for tag in soup.find_all(href=True)
+#         if str(tag.get("href", "")).lower().startswith("http://")
+#     )
+#     scores, overall_score, grade, issues = score_audit(
+#         title=title,
+#         meta_description=meta_description,
+#         h1_tags=h1_tags,
+#         robots_exists=robots_ok,
+#         robots_blocks_all=robots_blocks_all(robots_body),
+#         sitemap_exists=sitemap_ok,
+#         has_sitewide_noindex=has_sitewide_noindex,
+#         json_ld=json_ld,
+#         page_weight_bytes=len(response.content),
+#         images_missing_alt=missing_alt,
+#         images_total=len(images),
+#         is_https=urlparse(final_url).scheme.lower() == "https",
+#         viewport_exists=viewport is not None,
+#         mixed_content_count=mixed_content_count,
+#     )
+
+#     report = AuditResponse(
+#         url=target_url,
+#         final_url=final_url,
+#         status_code=response.status_code,
+#         title=title,
+#         meta_description=meta_description,
+#         h1_tags=h1_tags,
+#         robots_txt={"exists": robots_ok, "status_code": robots_status, "content": robots_body},
+#         sitemap_xml={"exists": sitemap_ok, "status_code": sitemap_status},
+#         viewport_meta={"exists": viewport is not None, "content": viewport.get("content") if viewport else None},
+#         is_https=urlparse(final_url).scheme.lower() == "https",
+#         images_missing_alt=missing_alt,
+#         images_total=len(images),
+#         json_ld=json_ld,
+#         page_weight_bytes=len(response.content),
+#         has_sitewide_noindex=has_sitewide_noindex,
+#         mixed_content_count=mixed_content_count,
+#         scores=scores,
+#         overall_score=overall_score,
+#         grade=grade,
+#         issues=issues,
+#     )
+#     share_id = persist_report(report.model_dump())
+#     return AuditResponse(**{**report.model_dump(), **report_urls(share_id)})
 
 
 
