@@ -102,12 +102,15 @@ logger = logging.getLogger("uvicorn.error")
 engine_options = {"pool_pre_ping": True}
 if database_url and ".pooler.supabase.com" in database_url:
     # Supabase transaction pooler connections must not be held by SQLAlchemy, and the
-    # pooler can reject duplicate prepared-statement names. Disable statement caching.
+    # pooler can reject duplicate prepared statements when a connection is reused.
+    pooler_url = make_url(database_url)
     engine_options.update({
         "poolclass": NullPool,
         "connect_args": {
+            "prepare_threshold": 0,
             "sslmode": "require",
-            "prepared_statement_cache_size": 0,
+            "user": pooler_url.username,
+            "password": pooler_url.password,
         },
     })
 
