@@ -97,8 +97,6 @@ def ensure_schema() -> None:
             """))
 
 
-ensure_schema()
-
 logger = logging.getLogger("uvicorn.error")
 
 engine_options = {"pool_pre_ping": True}
@@ -115,6 +113,9 @@ if database_url and ".pooler.supabase.com" in database_url:
     })
 
 engine = create_engine(database_url, **engine_options) if database_url else None
+
+if engine is not None:
+    ensure_schema()
 
 if database_url:
     if database_url.startswith("sqlite"):
