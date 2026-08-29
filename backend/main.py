@@ -53,6 +53,7 @@ if database_url and database_url.startswith("postgresql"):
     database_url = parsed_database_url.render_as_string(hide_password=False)
 
 
+
 def ensure_schema() -> None:
     if engine is None:
         return
