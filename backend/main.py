@@ -536,11 +536,30 @@ def meta_value(soup: BeautifulSoup, name: str) -> str | None:
     return tag.get("content", "").strip() if tag else None
 
 
+# @app.get("/api/health")
+# async def health() -> dict[str, str] bool]:
+#     if engine is None:
+#         return {"status": "ok", "database": "not_configured"}
+#     database = make_url(database_url) if database_url else None
+#     connection_info = {
+#         "database_host": database.host or "unknown",
+#         "database_port": str(database.port or "default"),
+#         "database_user": database.username or "unknown",
+#         "resend_configured": (
+#             bool(os.getenv("RESEND_API_KEY", "").strip())
+#             and bool(os.getenv("RESEND_FROM_EMAIL", "").strip())
+#         ),
+    
+#     }
+
+
 @app.get("/api/health")
-async def health() -> dict[str, str]:
+async def health() -> dict[str, str | bool]:
     if engine is None:
         return {"status": "ok", "database": "not_configured"}
+
     database = make_url(database_url) if database_url else None
+
     connection_info = {
         "database_host": database.host or "unknown",
         "database_port": str(database.port or "default"),
@@ -549,8 +568,8 @@ async def health() -> dict[str, str]:
             bool(os.getenv("RESEND_API_KEY", "").strip())
             and bool(os.getenv("RESEND_FROM_EMAIL", "").strip())
         ),
-    
     }
+
     try:
         with engine.connect() as connection:
             connection.execute(text("select 1"))
