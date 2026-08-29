@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="SiteScore favicon">
+  <defs>
+    <linearGradient id="g" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#77e1b5"/>
+      <stop offset="100%" stop-color="#5db6ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="#07162e"/>
+  <path d="M17 40h11.8L39 23.2V18H25v8.8l-8 13.4zm8.5-8.2l4.4-7.7 5.7 9.9H25.5v-2.2z" fill="url(#g)"/>
+  <path d="M41 44.5c4.4-1.7 7.5-5.8 7.5-10.7 0-6.8-5.5-12.3-12.3-12.3-4.8 0-9.1 2.7-11.2 6.7l4.6 2.2c1.4-2.5 4.1-4.1 7-4.1 4.4 0 8 3.6 8 8 0 3.4-2.1 6.3-5.1 7.4l-1.2 0.5v4.3l-2.1-0.8z" fill="#f8fbff" opacity="0.9"/>
+</svg>

@@ -3,16 +3,20 @@ from __future__ import annotations
 import os
 import re
 import html
+import json
 import secrets
 import io
 import logging
+import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
+from PIL import Image, ImageDraw, ImageFont
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, HttpUrl
 from sqlalchemy import create_engine, text
@@ -23,12 +27,12 @@ from sqlalchemy.pool import NullPool
 app = FastAPI(title="SiteScore API", version="0.1.0")
 
 raw_database_url = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'") or None
-database_url = raw_database_url
+database_url = raw_database_url or "sqlite:///./site_score.db"
 
-if database_url and database_url.startswith("postgresql://"):
+if database_url.startswith("postgresql://"):
     database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
-if database_url:
+if database_url and database_url.startswith("postgresql"):
     parsed_database_url = make_url(database_url)
     if parsed_database_url.host is None or parsed_database_url.username is None or parsed_database_url.password is None:
         raise RuntimeError("DATABASE_URL must be a complete PostgreSQL URL with username and password")
@@ -48,6 +52,53 @@ if database_url:
     # render_as_string(hide_password=False) is required to keep the real password.
     database_url = parsed_database_url.render_as_string(hide_password=False)
 
+
+def ensure_schema() -> None:
+    if engine is None:
+        return
+    with engine.begin() as connection:
+        if database_url.startswith("sqlite"):
+            connection.execute(text("""
+                create table if not exists public.audit_reports (
+                    short_id text primary key,
+                    url text not null,
+                    final_url text not null,
+                    domain text not null,
+                    overall_score integer not null,
+                    grade text not null,
+                    report text not null
+                )
+            """))
+            connection.execute(text("""
+                create table if not exists public.lead_captures (
+                    report_short_id text not null,
+                    email text not null,
+                    primary key (report_short_id, email)
+                )
+            """))
+        else:
+            connection.execute(text("""
+                create table if not exists public.audit_reports (
+                    short_id text primary key,
+                    url text not null,
+                    final_url text not null,
+                    domain text not null,
+                    overall_score integer not null,
+                    grade text not null,
+                    report jsonb not null
+                )
+            """))
+            connection.execute(text("""
+                create table if not exists public.lead_captures (
+                    report_short_id text not null,
+                    email text not null,
+                    primary key (report_short_id, email)
+                )
+            """))
+
+
+ensure_schema()
+
 logger = logging.getLogger("uvicorn.error")
 
 engine_options = {"pool_pre_ping": True}
@@ -66,7 +117,10 @@ if database_url and ".pooler.supabase.com" in database_url:
 engine = create_engine(database_url, **engine_options) if database_url else None
 
 if database_url:
-    safe_database_url = make_url(database_url).render_as_string(hide_password=True)
+    if database_url.startswith("sqlite"):
+        safe_database_url = database_url
+    else:
+        safe_database_url = make_url(database_url).render_as_string(hide_password=True)
     logger.info("Database configured: %s", safe_database_url)
 
 allowed_origins = [
@@ -122,6 +176,19 @@ class LeadCaptureResponse(BaseModel):
     message: str
 
 
+rate_limit_store: dict[str, list[float]] = defaultdict(list)
+
+
+def rate_limit_exceeded(client_ip: str, *, limit: int, window_seconds: int) -> bool:
+    now = time.monotonic()
+    events = rate_limit_store[client_ip]
+    rate_limit_store[client_ip] = [event for event in events if now - event < window_seconds]
+    if len(rate_limit_store[client_ip]) >= limit:
+        return True
+    rate_limit_store[client_ip].append(now)
+    return False
+
+
 def public_api_url() -> str:
     return os.getenv("PUBLIC_API_URL", "http://localhost:8000").rstrip("/")
 
@@ -133,28 +200,46 @@ def frontend_url() -> str:
 def persist_report(report: dict[str, Any]) -> str:
     if engine is None:
         raise HTTPException(status_code=503, detail="Report storage is not configured on the API.")
-    from json import dumps
 
     for _ in range(5):
         short_id = secrets.token_urlsafe(7).replace("-", "_")[:10]
         try:
+            payload = json.dumps(report)
             with engine.begin() as connection:
-                connection.execute(
-                    text("""
-                        insert into public.audit_reports
-                          (short_id, url, final_url, domain, overall_score, grade, report)
-                        values (:short_id, :url, :final_url, :domain, :overall_score, :grade, cast(:report as jsonb))
-                    """),
-                    {
-                        "short_id": short_id,
-                        "url": report["url"],
-                        "final_url": report["final_url"],
-                        "domain": urlparse(report["final_url"]).netloc,
-                        "overall_score": report["overall_score"],
-                        "grade": report["grade"],
-                        "report": dumps(report),
-                    },
-                )
+                if str(database_url).startswith("sqlite"):
+                    connection.execute(
+                        text("""
+                            insert into public.audit_reports
+                              (short_id, url, final_url, domain, overall_score, grade, report)
+                            values (:short_id, :url, :final_url, :domain, :overall_score, :grade, :report)
+                        """),
+                        {
+                            "short_id": short_id,
+                            "url": report["url"],
+                            "final_url": report["final_url"],
+                            "domain": urlparse(report["final_url"]).netloc,
+                            "overall_score": report["overall_score"],
+                            "grade": report["grade"],
+                            "report": payload,
+                        },
+                    )
+                else:
+                    connection.execute(
+                        text("""
+                            insert into public.audit_reports
+                              (short_id, url, final_url, domain, overall_score, grade, report)
+                            values (:short_id, :url, :final_url, :domain, :overall_score, :grade, cast(:report as jsonb))
+                        """),
+                        {
+                            "short_id": short_id,
+                            "url": report["url"],
+                            "final_url": report["final_url"],
+                            "domain": urlparse(report["final_url"]).netloc,
+                            "overall_score": report["overall_score"],
+                            "grade": report["grade"],
+                            "report": payload,
+                        },
+                    )
             return short_id
         except Exception as exc:
             if "duplicate key" not in str(exc).lower():
@@ -170,7 +255,10 @@ def load_report(short_id: str) -> dict[str, Any]:
         row = connection.execute(text("select report from public.audit_reports where short_id = :short_id"), {"short_id": short_id}).mappings().first()
     if row is None:
         raise HTTPException(status_code=404, detail="That shared report does not exist.")
-    return row["report"]
+    report = row["report"]
+    if isinstance(report, str):
+        return json.loads(report)
+    return report
 
 
 def capture_lead(short_id: str, email: str) -> None:
@@ -226,7 +314,54 @@ def build_pdf(report: dict[str, Any]) -> bytes:
 
 def report_urls(short_id: str) -> dict[str, str]:
     base = public_api_url()
-    return {"share_id": short_id, "share_url": f"{base}/r/{short_id}", "og_image_url": f"{base}/api/reports/{short_id}/og.svg"}
+    return {"share_id": short_id, "share_url": f"{base}/r/{short_id}", "og_image_url": f"{base}/api/reports/{short_id}/og.png"}
+
+
+def build_og_image(report: dict[str, Any]) -> bytes:
+    width, height = 1200, 630
+    image = Image.new("RGB", (width, height), "#07162e")
+    draw = ImageDraw.Draw(image)
+
+    for y in range(height):
+        ratio = y / height
+        r = int(7 + (25 - 7) * ratio)
+        g = int(18 + (49 - 18) * ratio)
+        b = int(36 + (81 - 36) * ratio)
+        draw.line((0, y, width, y), fill=(r, g, b))
+
+    glow = (12, 28, 58)
+    draw.ellipse((820, -120, 1260, 360), fill=glow)
+    draw.rounded_rectangle((70, 70, 1125, 540), radius=26, fill=(13, 23, 38, 200), outline=(40, 74, 128), width=2)
+    draw.rounded_rectangle((780, 170, 1080, 430), radius=24, fill=(119, 225, 181, 28), outline=(119, 225, 181), width=2)
+
+    try:
+        tag_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
+        domain_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 46)
+        score_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 136)
+        grade_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 180)
+        body_font = ImageFont.truetype("DejaVuSans.ttf", 26)
+    except OSError:
+        tag_font = ImageFont.load_default()
+        domain_font = ImageFont.load_default()
+        score_font = ImageFont.load_default()
+        grade_font = ImageFont.load_default()
+        body_font = ImageFont.load_default()
+
+    domain = urlparse(report["final_url"]).netloc or "example.com"
+    grade = str(report["grade"])
+    score = str(report["overall_score"])
+
+    draw.text((90, 105), "SiteScore", font=tag_font, fill=(119, 225, 181))
+    draw.text((90, 190), "SEO REPORT", font=body_font, fill=(157, 177, 205))
+    draw.text((90, 240), domain, font=domain_font, fill=(248, 251, 255))
+    draw.text((90, 475), "overall score", font=body_font, fill=(157, 177, 205))
+    draw.text((810, 180), grade, font=grade_font, fill=(119, 225, 181))
+    draw.text((855, 370), score, font=score_font, fill=(248, 251, 255))
+    draw.text((860, 490), "/ 100", font=body_font, fill=(157, 177, 205))
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 @dataclass
@@ -371,36 +506,27 @@ async def get_report(short_id: str) -> AuditResponse:
     return AuditResponse(**{**report, **report_urls(short_id)})
 
 
-@app.get("/api/reports/{short_id}/og.svg")
+@app.get("/api/reports/{short_id}/og.png")
 async def report_og_image(short_id: str) -> Response:
     report = load_report(short_id)
-    domain = html.escape(urlparse(report["final_url"]).netloc)
-    grade = html.escape(report["grade"])
-    score = report["overall_score"]
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
-            <rect width="1200" height="630" fill="#07162e"/>
-            <circle cx="1010" cy="-40" r="360" fill="#0b2347"/>
-            <text x="76" y="100" fill="#77e1b5" font-family="Arial,sans-serif" font-size="28" font-weight="700">SiteScore</text>
-            <text x="76" y="200" fill="#9db1cd" font-family="Arial,sans-serif" font-size="24">SEO READ FOR</text>
-            <text x="76" y="260" fill="#f8fbff" font-family="Arial,sans-serif" font-size="44" font-weight="700">{domain}</text>
-            <text x="76" y="480" fill="#77e1b5" font-family="Arial,sans-serif" font-size="170" font-weight="700">{grade}</text>
-            <text x="310" y="455" fill="#f8fbff" font-family="Arial,sans-serif" font-size="88" font-weight="700">{score}</text>
-            <text x="315" y="500" fill="#9db1cd" font-family="Arial,sans-serif" font-size="22">/ 100 overall score</text>
-            <rect x="76" y="550" width="1048" height="2" fill="#24436d"/>
-            <text x="76" y="590" fill="#9db1cd" font-family="Arial,sans-serif" font-size="18">Technical signals, made legible.</text>
-    </svg>'''
-    return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
+    return Response(content=build_og_image(report), media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
 
 
 @app.post("/api/reports/{short_id}/lead", response_model=LeadCaptureResponse)
-async def create_lead(short_id: str, request: LeadCaptureRequest) -> LeadCaptureResponse:
+async def create_lead(short_id: str, request: LeadCaptureRequest, http_request: Request) -> LeadCaptureResponse:
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    if rate_limit_exceeded(client_ip, limit=10, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many lead submissions from this IP. Please wait a minute and try again.")
     load_report(short_id)
     capture_lead(short_id, str(request.email))
     return LeadCaptureResponse(success=True, message="Your detailed fixes are unlocked.")
 
 
 @app.post("/api/reports/{short_id}/pdf")
-async def download_pdf(short_id: str, request: LeadCaptureRequest) -> Response:
+async def download_pdf(short_id: str, request: LeadCaptureRequest, http_request: Request) -> Response:
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    if rate_limit_exceeded(client_ip, limit=10, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many report downloads from this IP. Please wait a minute and try again.")
     report = load_report(short_id)
     if not lead_has_access(short_id, str(request.email)):
         raise HTTPException(status_code=403, detail="Submit your email before downloading the report.")
@@ -413,18 +539,27 @@ async def shared_report(short_id: str) -> Response:
     urls = report_urls(short_id)
     title = html.escape(f"{report['grade']} grade for {urlparse(report['final_url']).netloc} | SiteScore")
     description = html.escape(f"SiteScore found an overall SEO score of {report['overall_score']}/100 for {urlparse(report['final_url']).netloc}.")
+    domain = html.escape(urlparse(report['final_url']).netloc)
     destination = f"{frontend_url()}/r/{short_id}"
     page = f'''<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
             <meta name="description" content="{description}"><meta property="og:title" content="{title}">
             <meta property="og:description" content="{description}"><meta property="og:type" content="website">
-            <meta property="og:image" content="{urls['og_image_url']}"><meta property="og:url" content="{urls['share_url']}">
+            <meta property="og:url" content="{urls['share_url']}"><meta property="og:image" content="{urls['og_image_url']}">
+            <meta property="og:image:type" content="image/png"><meta property="og:image:width" content="1200">
+            <meta property="og:image:height" content="630"><meta property="og:image:alt" content="SiteScore report for {domain}">
+            <meta property="og:site_name" content="SiteScore"><meta name="twitter:card" content="summary_large_image">
+            <meta name="twitter:title" content="{title}"><meta name="twitter:description" content="{description}">
+            <meta name="twitter:image" content="{urls['og_image_url']}"><meta name="twitter:image:alt" content="SiteScore report for {domain}">
             <meta http-equiv="refresh" content="0;url={destination}"></head>
             <body style="font-family:Arial,sans-serif;background:#07162e;color:white;padding:40px">Opening your SiteScore report...</body></html>'''
     return Response(content=page, media_type="text/html")
 
 
 @app.post("/api/audit", response_model=AuditResponse)
-async def audit_site(request: AuditRequest) -> AuditResponse:
+async def audit_site(request: AuditRequest, http_request: Request) -> AuditResponse:
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    if rate_limit_exceeded(client_ip, limit=5, window_seconds=60):
+        raise HTTPException(status_code=429, detail="Too many audit requests from this IP. Please wait a minute and try again.")
     target_url = str(request.url)
     parsed = urlparse(target_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
